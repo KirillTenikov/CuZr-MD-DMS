@@ -1,0 +1,144 @@
+# CuZr-MD-DMS base image
+#
+# Purpose:
+#   Base image for Paper 2 MD-DMS calculations with MACE.
+#
+# Important:
+#   This image DOES NOT build LAMMPS.
+#   LAMMPS should be built later on the actual cloud GPU machine,
+#   using ML-IAP + Kokkos CUDA.
+#
+# Optimization direction:
+#   This image includes cuEquivariance-related Python packages so that
+#   MACE ML-IAP runs can use the accelerated equivariant operations path
+#   when the LAMMPS ML-IAP plugin and converted MACE model support it.
+
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+LABEL org.opencontainers.image.title="CuZr-MD-DMS Base"
+LABEL org.opencontainers.image.description="CUDA/PyTorch/MACE/cuEquivariance base image for Cu-Zr MD-DMS calculations. LAMMPS is built separately on cloud GPU machines."
+LABEL org.opencontainers.image.authors="KirillTenikov"
+LABEL org.opencontainers.image.source="https://github.com/KirillTenikov/CuZr-MD-DMS"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+ENV PIP_NO_CACHE_DIR=1
+ENV PYTHONUNBUFFERED=1
+
+# Conservative runtime defaults.
+# For LAMMPS/Kokkos production runs, tune these on the cloud machine.
+ENV OMP_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+ENV OPENBLAS_NUM_THREADS=1
+ENV VECLIB_MAXIMUM_THREADS=1
+ENV NUMEXPR_NUM_THREADS=1
+
+# MACE profiling/timing switches.
+# Leave off by default; enable in a specific profiling run:
+#   export MACE_TIME=true
+#   export MACE_PROFILE=true
+ENV MACE_TIME=false
+ENV MACE_PROFILE=false
+
+# System dependencies:
+# - compilers/CMake/Ninja for later LAMMPS builds
+# - OpenMPI for possible MPI-enabled LAMMPS builds
+# - FFTW/Voro++ and other libraries useful for LAMMPS packages
+# - tmux/htop/nano/vim for practical cloud debugging
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    wget \
+    git \
+    git-lfs \
+    nano \
+    vim \
+    tmux \
+    htop \
+    procps \
+    build-essential \
+    gfortran \
+    cmake \
+    ninja-build \
+    pkg-config \
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    python-is-python3 \
+    openmpi-bin \
+    libopenmpi-dev \
+    libfftw3-dev \
+    libvoro++-dev \
+    libopenblas-dev \
+    zlib1g-dev \
+    libssl-dev \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python virtual environment.
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# PyTorch CUDA 12.4.
+# torch==2.5.0 is chosen because MACE ML-IAP docs recommend torch<=2.5.0
+# to avoid newer model-loading warnings.
+RUN pip install \
+    --index-url https://download.pytorch.org/whl/cu124 \
+    torch==2.5.0
+
+# MACE, cuEquivariance acceleration stack, and scientific Python tools.
+#
+# cuEquivariance packages:
+#   cuequivariance
+#   cuequivariance-torch
+#   cuequivariance-ops-torch-cu12
+#
+# cupy-cuda12x is included for CUDA 12.x compatibility.
+RUN pip install \
+    "numpy<2" \
+    scipy \
+    pandas \
+    matplotlib \
+    ase \
+    pyyaml \
+    jinja2 \
+    tqdm \
+    h5py \
+    psutil \
+    rich \
+    cupy-cuda12x \
+    cuequivariance \
+    cuequivariance-torch \
+    cuequivariance-ops-torch-cu12 \
+    mace-torch==0.3.15
+
+# Build-time sanity check.
+# CUDA is usually not visible during docker build, so torch.cuda.is_available()
+# may be false here. That is okay.
+RUN python - <<'PY'
+import torch
+import mace
+import numpy
+import scipy
+import pandas
+import ase
+import cuequivariance as cue
+import cuequivariance_torch as cuet
+import cupy
+
+print("Python environment OK")
+print("torch:", torch.__version__)
+print("CUDA visible during build:", torch.cuda.is_available())
+print("mace:", mace.__file__)
+print("cuequivariance:", cue.__version__ if hasattr(cue, "__version__") else "imported")
+print("cuequivariance_torch:", cuet.__file__)
+print("cupy:", cupy.__version__)
+PY
+
+WORKDIR /workspace
+
+CMD ["/bin/bash"]

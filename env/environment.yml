@@ -1,0 +1,17 @@
+name: cuzr-mddms
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - ase
+  - pyyaml
+  - jinja2
+  - tqdm
+  - h5py
+  - psutil
+  - rich
+  - pip

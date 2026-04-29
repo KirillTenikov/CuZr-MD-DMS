@@ -1,0 +1,21 @@
+[project]
+name = "cuzr-mddms"
+version = "0.1.0"
+description = "MD-DMS workflow for Cu-Zr metallic glass NCL simulations"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "scipy",
+  "pandas",
+  "matplotlib",
+  "ase",
+  "pyyaml",
+  "jinja2",
+  "tqdm",
+  "h5py",
+  "psutil",
+  "rich",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# Runtime files
+cuzr_mddms_runtime.env
+
+# Generated simulation data
+runs/*
+!runs/.gitkeep
+outputs/
+logs/
+
+# Heavy MD files
+*.dump
+*.lammpstrj
+*.restart
+*.data
+*.h5
+*.npy
+*.npz
+*.xtc
+*.dcd
+
+# Large model / potential files
+models/**/*.pt
+models/**/*.model
+models/**/*.alloy
+models/**/*.eam
+!models/mace/.gitkeep
+!models/eam/.gitkeep
