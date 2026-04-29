@@ -8,10 +8,10 @@
 #   LAMMPS should be built later on the actual cloud GPU machine,
 #   using ML-IAP + Kokkos CUDA.
 #
-# Optimization direction:
-#   This image includes cuEquivariance-related Python packages so that
-#   MACE ML-IAP runs can use the accelerated equivariant operations path
-#   when the LAMMPS ML-IAP plugin and converted MACE model support it.
+# Notes:
+#   This version explicitly enables the Ubuntu "universe" repository because
+#   packages such as git-lfs and libvoro++-dev may not be visible in minimal
+#   NVIDIA CUDA Ubuntu images without it.
 
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
@@ -26,7 +26,6 @@ ENV PIP_NO_CACHE_DIR=1
 ENV PYTHONUNBUFFERED=1
 
 # Conservative runtime defaults.
-# For LAMMPS/Kokkos production runs, tune these on the cloud machine.
 ENV OMP_NUM_THREADS=1
 ENV MKL_NUM_THREADS=1
 ENV OPENBLAS_NUM_THREADS=1
@@ -34,11 +33,22 @@ ENV VECLIB_MAXIMUM_THREADS=1
 ENV NUMEXPR_NUM_THREADS=1
 
 # MACE profiling/timing switches.
-# Leave off by default; enable in a specific profiling run:
+# Enable only in specific profiling runs:
 #   export MACE_TIME=true
 #   export MACE_PROFILE=true
 ENV MACE_TIME=false
 ENV MACE_PROFILE=false
+
+# Enable Ubuntu universe repository first.
+# Some useful build/runtime packages in minimal CUDA images are not available
+# until universe is enabled.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    ca-certificates \
+    gnupg \
+    && add-apt-repository -y universe \
+    && apt-get update \
+    && rm -rf /var/lib/apt/lists/*
 
 # System dependencies:
 # - compilers/CMake/Ninja for later LAMMPS builds
@@ -84,20 +94,13 @@ ENV PATH="/opt/venv/bin:${PATH}"
 RUN python -m pip install --upgrade pip setuptools wheel
 
 # PyTorch CUDA 12.4.
-# torch==2.5.0 is chosen because MACE ML-IAP docs recommend torch<=2.5.0
-# to avoid newer model-loading warnings.
+# torch==2.5.0 is chosen because MACE ML-IAP workflows have been more stable
+# with torch<=2.5 in several MACE/LAMMPS setups.
 RUN pip install \
     --index-url https://download.pytorch.org/whl/cu124 \
     torch==2.5.0
 
 # MACE, cuEquivariance acceleration stack, and scientific Python tools.
-#
-# cuEquivariance packages:
-#   cuequivariance
-#   cuequivariance-torch
-#   cuequivariance-ops-torch-cu12
-#
-# cupy-cuda12x is included for CUDA 12.x compatibility.
 RUN pip install \
     "numpy<2" \
     scipy \
@@ -126,17 +129,22 @@ import numpy
 import scipy
 import pandas
 import ase
-import cuequivariance as cue
-import cuequivariance_torch as cuet
 import cupy
 
 print("Python environment OK")
 print("torch:", torch.__version__)
 print("CUDA visible during build:", torch.cuda.is_available())
 print("mace:", mace.__file__)
-print("cuequivariance:", cue.__version__ if hasattr(cue, "__version__") else "imported")
-print("cuequivariance_torch:", cuet.__file__)
 print("cupy:", cupy.__version__)
+
+try:
+    import cuequivariance as cue
+    import cuequivariance_torch as cuet
+    print("cuequivariance:", getattr(cue, "__version__", "imported"))
+    print("cuequivariance_torch:", cuet.__file__)
+except Exception as exc:
+    print("WARNING: cuEquivariance import failed during build:", repr(exc))
+    raise
 PY
 
 WORKDIR /workspace
