@@ -5,13 +5,11 @@
 #
 # Important:
 #   This image DOES NOT build LAMMPS.
-#   LAMMPS should be built later on the actual cloud GPU machine,
-#   using ML-IAP + Kokkos CUDA.
+#   LAMMPS should be built later on the actual cloud GPU machine.
 #
-# Notes:
-#   This version explicitly enables the Ubuntu "universe" repository because
-#   packages such as git-lfs and libvoro++-dev may not be visible in minimal
-#   NVIDIA CUDA Ubuntu images without it.
+# This v3 Dockerfile intentionally keeps apt dependencies minimal and robust.
+# We removed optional packages that can be missing in some NVIDIA/Ubuntu mirrors
+# such as git-lfs and libvoro++-dev. Voronoi support can be added later if needed.
 
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
@@ -33,58 +31,45 @@ ENV VECLIB_MAXIMUM_THREADS=1
 ENV NUMEXPR_NUM_THREADS=1
 
 # MACE profiling/timing switches.
-# Enable only in specific profiling runs:
+# Enable only in profiling runs:
 #   export MACE_TIME=true
 #   export MACE_PROFILE=true
 ENV MACE_TIME=false
 ENV MACE_PROFILE=false
 
-# Enable Ubuntu universe repository first.
-# Some useful build/runtime packages in minimal CUDA images are not available
-# until universe is enabled.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    software-properties-common \
-    ca-certificates \
-    gnupg \
-    && add-apt-repository -y universe \
-    && apt-get update \
-    && rm -rf /var/lib/apt/lists/*
-
-# System dependencies:
-# - compilers/CMake/Ninja for later LAMMPS builds
-# - OpenMPI for possible MPI-enabled LAMMPS builds
-# - FFTW/Voro++ and other libraries useful for LAMMPS packages
-# - tmux/htop/nano/vim for practical cloud debugging
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash \
-    ca-certificates \
-    curl \
-    wget \
-    git \
-    git-lfs \
-    nano \
-    vim \
-    tmux \
-    htop \
-    procps \
-    build-essential \
-    gfortran \
-    cmake \
-    ninja-build \
-    pkg-config \
-    python3 \
-    python3-dev \
-    python3-pip \
-    python3-venv \
-    python-is-python3 \
-    openmpi-bin \
-    libopenmpi-dev \
-    libfftw3-dev \
-    libvoro++-dev \
-    libopenblas-dev \
-    zlib1g-dev \
-    libssl-dev \
-    libffi-dev \
+# Core system dependencies only.
+# Optional dependencies such as libvoro++-dev are deliberately not installed here
+# to keep the image build robust on Docker Desktop / Docker Hub / cloud builders.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        wget \
+        git \
+        nano \
+        vim \
+        tmux \
+        htop \
+        procps \
+        build-essential \
+        gfortran \
+        cmake \
+        ninja-build \
+        pkg-config \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3-venv \
+        python-is-python3 \
+        openmpi-bin \
+        libopenmpi-dev \
+        libfftw3-dev \
+        libopenblas-dev \
+        zlib1g-dev \
+        libssl-dev \
+        libffi-dev \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Python virtual environment.
@@ -94,13 +79,12 @@ ENV PATH="/opt/venv/bin:${PATH}"
 RUN python -m pip install --upgrade pip setuptools wheel
 
 # PyTorch CUDA 12.4.
-# torch==2.5.0 is chosen because MACE ML-IAP workflows have been more stable
-# with torch<=2.5 in several MACE/LAMMPS setups.
+# torch==2.5.0 is a conservative choice for MACE/LAMMPS ML-IAP workflows.
 RUN pip install \
     --index-url https://download.pytorch.org/whl/cu124 \
     torch==2.5.0
 
-# MACE, cuEquivariance acceleration stack, and scientific Python tools.
+# Scientific Python + MACE + cuEquivariance stack.
 RUN pip install \
     "numpy<2" \
     scipy \
@@ -120,8 +104,7 @@ RUN pip install \
     mace-torch==0.3.15
 
 # Build-time sanity check.
-# CUDA is usually not visible during docker build, so torch.cuda.is_available()
-# may be false here. That is okay.
+# CUDA is usually not visible during docker build; that is okay.
 RUN python - <<'PY'
 import torch
 import mace
@@ -137,14 +120,10 @@ print("CUDA visible during build:", torch.cuda.is_available())
 print("mace:", mace.__file__)
 print("cupy:", cupy.__version__)
 
-try:
-    import cuequivariance as cue
-    import cuequivariance_torch as cuet
-    print("cuequivariance:", getattr(cue, "__version__", "imported"))
-    print("cuequivariance_torch:", cuet.__file__)
-except Exception as exc:
-    print("WARNING: cuEquivariance import failed during build:", repr(exc))
-    raise
+import cuequivariance as cue
+import cuequivariance_torch as cuet
+print("cuequivariance:", getattr(cue, "__version__", "imported"))
+print("cuequivariance_torch:", cuet.__file__)
 PY
 
 WORKDIR /workspace
