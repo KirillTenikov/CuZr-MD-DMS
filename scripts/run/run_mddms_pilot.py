@@ -138,7 +138,10 @@ class RunConfig:
     strain_amplitude: float
     tdamp_ps: float
     pdamp_ps: float
+    dump_trajectory: bool
     dump_atomic: bool
+    dump_voronoi: bool
+    dump_every_steps: int | None
     stress_sign: float
     lmp_command: str
 
@@ -330,24 +333,42 @@ write_restart   02_after_equilibrate_nvt.restart
 
 
 def write_mddms_input(run_dir: Path, cfg: RunConfig, preset: Preset) -> None:
-    mddms_ps = preset.mddms_period_ps * preset.mddms_cycles
-    mddms_steps = ps_to_steps(mddms_ps, cfg.timestep_ps)
+    mddms_steps = ps_to_steps(preset.mddms_period_ps * preset.mddms_cycles, cfg.timestep_ps)
+    dump_every = cfg.dump_every_steps or preset.dump_every_steps
+
+    trajectory_dump = ""
+    if cfg.dump_trajectory:
+        trajectory_dump = f"""
+# OVITO-friendly structural trajectory.
+# id/type are required for consistent particle tracking.
+# x/y/z plus image flags allow reconstruction of wrapped/unwrapped motion.
+dump            trajdump all custom {dump_every} trajectory.lammpstrj id type x y z ix iy iz
+dump_modify     trajdump sort id
+"""
 
     atomic_dump = ""
     if cfg.dump_atomic:
-        atomic_dump = f"""
-# Atomic-level stress output.
-# c_atomstress[4] is the xy component of LAMMPS stress/atom.
-# This first pilot does not require the LAMMPS VORONOI package.
+        if cfg.dump_voronoi:
+            atomic_dump = f"""
+# Atomic stress plus Voronoi volume output for selected local-response runs.
+# Requires LAMMPS VORONOI package.
 compute         atomstress all stress/atom NULL
-dump            atomdump all custom {preset.dump_every_steps} atom_stress.lammpstrj id type x y z c_atomstress[4]
-dump_modify     atomdump sort id
+compute         atomvol all voronoi/atom
+dump            stressdump all custom {dump_every} atom_stress.lammpstrj id type x y z ix iy iz c_atomstress[1] c_atomstress[2] c_atomstress[3] c_atomstress[4] c_atomstress[5] c_atomstress[6] c_atomvol[1]
+dump_modify     stressdump sort id
+"""
+        else:
+            atomic_dump = f"""
+# Atomic stress output for selected local-response runs.
+# c_atomstress[4] is the xy component relevant for xy shear.
+compute         atomstress all stress/atom NULL
+dump            stressdump all custom {dump_every} atom_stress.lammpstrj id type x y z ix iy iz c_atomstress[1] c_atomstress[2] c_atomstress[3] c_atomstress[4] c_atomstress[5] c_atomstress[6]
+dump_modify     stressdump sort id
 """
 
     text = f"""{common_header("02_after_equilibrate_nvt.data", cfg.model_kind, Path(cfg.model_file))}
 timestep        {cfg.timestep_ps:.8f}
 
-# The box must be triclinic before applying xy shear.
 change_box      all triclinic
 
 reset_timestep  0
@@ -356,9 +377,6 @@ velocity        all create {cfg.temperature_low_K:.6f} {cfg.seed + 404} mom yes 
 thermo          {preset.thermo_every_steps}
 thermo_style    custom step time temp pe ke etotal press pxx pyy pzz pxy lx ly lz xy
 
-# Sinusoidal shear strain:
-# gamma(t) = gamma0 * sin(2*pi*t/T)
-# LAMMPS xy tilt has units of length, so xy(t) = gamma(t) * Ly.
 variable        gamma0 equal {cfg.strain_amplitude:.12f}
 variable        period equal {preset.mddms_period_ps:.12f}
 variable        omega equal 2.0*{math.pi:.16f}/v_period
@@ -367,12 +385,9 @@ variable        gammadot equal v_gamma0*v_omega*cos(v_omega*time)
 variable        xy_target equal v_gamma*ly
 variable        xy_rate equal v_gammadot*ly
 
-# Thermostat during small-amplitude oscillatory shear.
-# This first implementation uses affine remapping of coordinates.
 fix             thermostat all nvt temp {cfg.temperature_low_K:.6f} {cfg.temperature_low_K:.6f} {cfg.tdamp_ps:.6f}
 fix             deform all deform 1 xy variable v_xy_target v_xy_rate remap x
 
-# System-level time series.
 variable        time_ps equal time
 variable        pxy_bar equal pxy
 variable        temp_K equal temp
@@ -383,6 +398,7 @@ variable        xy_A equal xy
 variable        ly_A equal ly
 
 fix             ts all ave/time {preset.stress_every_steps} 1 {preset.stress_every_steps} v_time_ps v_gamma v_pxy_bar v_temp_K v_pe_eV v_ke_eV v_press_bar v_xy_A v_ly_A file stress_timeseries.dat
+{trajectory_dump}
 {atomic_dump}
 run             {mddms_steps}
 
@@ -394,6 +410,7 @@ write_data      03_after_mddms.data
 write_restart   03_after_mddms.restart
 """
     (run_dir / "03_mddms_shear.in").write_text(text, encoding="utf-8")
+
 
 
 def write_run_shell_script(run_dir: Path, cfg: RunConfig) -> None:
@@ -621,6 +638,87 @@ def project_path(path_like: str | Path) -> Path:
     return (REPO_ROOT / path).resolve()
 
 
+def save_artifacts(run_dir: Path, artifact_root: Path, run_name: str, run_label: str) -> Path:
+    """Copy key outputs to a labeled results folder.
+
+    This is meant for preserving pilot/protocol-development runs without
+    pretending they are final production statistics.
+    """
+    import hashlib
+    import shutil
+    import time
+
+    run_dir = run_dir.resolve()
+    out_dir = (artifact_root / run_name).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    patterns = [
+        "metadata.json",
+        "mddms_fit.json",
+        "stress_timeseries.dat",
+        "*.in",
+        "*.log",
+        "03_after_mddms.data",
+        "03_after_mddms.restart",
+        "trajectory.lammpstrj",
+        "atom_stress.lammpstrj",
+    ]
+
+    copied: list[dict[str, object]] = []
+    seen: set[Path] = set()
+
+    for pattern in patterns:
+        for src in sorted(run_dir.glob(pattern)):
+            if not src.is_file() or src in seen:
+                continue
+            seen.add(src)
+            dst = out_dir / src.name
+            shutil.copy2(src, dst)
+            sha = hashlib.sha256(dst.read_bytes()).hexdigest()
+            copied.append(
+                {
+                    "name": dst.name,
+                    "bytes": dst.stat().st_size,
+                    "sha256": sha,
+                }
+            )
+
+    readme = f"""# {run_name}
+
+Saved MD-DMS run artifact.
+
+Status: {run_label}
+
+Source run directory:
+
+```text
+{run_dir}
+```
+
+Notes:
+- Pilot/protocol-development runs should not be mixed into final Paper 2 statistics unless explicitly reclassified.
+- `stress_timeseries.dat` and `mddms_fit.json` are system-level MD-DMS outputs.
+- `trajectory.lammpstrj` is intended for OVITO structural visualization if present.
+- `atom_stress.lammpstrj` is intended for selected local-response analysis if present.
+"""
+    (out_dir / "README.md").write_text(readme, encoding="utf-8")
+
+    manifest = {
+        "run_name": run_name,
+        "run_label": run_label,
+        "source_run_dir": str(run_dir),
+        "artifact_dir": str(out_dir),
+        "created_unix_time": time.time(),
+        "files": copied,
+    }
+    (out_dir / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    print(f"[ok] Saved artifacts to: {out_dir}")
+    print(f"[ok] Copied {len(copied)} files")
+    return out_dir
+
+
+
 def print_model_aliases() -> None:
     print("Available model aliases:")
     for alias, info in MODEL_ALIASES.items():
@@ -687,9 +785,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--pdamp-ps", type=float, default=1.0)
 
     p.add_argument(
-        "--dump-atomic",
+        "--dump-trajectory",
         action="store_true",
-        help="Dump per-atom xy stress during MD-DMS. Can create large files.",
+        help="Write OVITO-friendly structural trajectory during MD-DMS: id type x y z ix iy iz.",
+    )
+    p.add_argument(
+        "--dump-atomic",
+        "--dump-atomic-stress",
+        dest="dump_atomic",
+        action="store_true",
+        help="Write per-atom stress trajectory during MD-DMS. Can create large files.",
+    )
+    p.add_argument(
+        "--dump-voronoi",
+        action="store_true",
+        help="Also write Voronoi volume with per-atom stress. Requires LAMMPS VORONOI package.",
+    )
+    p.add_argument(
+        "--dump-every-steps",
+        type=int,
+        default=None,
+        help="Override atomic/trajectory dump interval in MD steps.",
     )
     p.add_argument(
         "--stress-sign",
@@ -697,6 +813,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=-1.0,
         help="Multiplier for pxy when fitting stress. Use -1 or +1 depending on convention.",
     )
+    p.add_argument(
+        "--save-artifacts",
+        action="store_true",
+        help="Copy key outputs to results/pilots/<run-name> or another artifact root.",
+    )
+    p.add_argument("--artifact-root", default="results/pilots")
+    p.add_argument("--run-label", default="pilot / non-production")
     p.add_argument(
         "--lmp-command",
         default=None,
@@ -743,7 +866,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         strain_amplitude=args.strain_amplitude,
         tdamp_ps=args.tdamp_ps,
         pdamp_ps=args.pdamp_ps,
+        dump_trajectory=args.dump_trajectory,
         dump_atomic=args.dump_atomic,
+        dump_voronoi=args.dump_voronoi,
+        dump_every_steps=args.dump_every_steps,
         stress_sign=args.stress_sign,
         lmp_command=lmp_command,
     )
@@ -770,6 +896,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         fit_path.write_text(json.dumps(fit, indent=2), encoding="utf-8")
         print(f"[ok] Wrote fit: {fit_path}")
         print(json.dumps(fit, indent=2))
+
+    if args.save_artifacts:
+        save_artifacts(
+            run_dir=run_dir_path,
+            artifact_root=Path(args.artifact_root),
+            run_name=args.run_name,
+            run_label=args.run_label,
+        )
 
     print()
     print("Next commands:")
