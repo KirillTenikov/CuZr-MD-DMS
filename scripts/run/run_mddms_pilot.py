@@ -37,12 +37,14 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Iterable
 
 AMU_TO_G = 1.66053906660e-24
 CM3_TO_A3 = 1.0e24
 CU_MASS = 63.546
 ZR_MASS = 91.224
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -103,11 +105,26 @@ PRESETS: dict[str, Preset] = {
 }
 
 
+MODEL_ALIASES: dict[str, dict[str, str]] = {
+    "mace_c": {
+        "kind": "mace",
+        "path": "models/mace/mace_C.model-mliap_lammps.pt",
+        "description": "MACE_C converted to LAMMPS ML-IAP format",
+    },
+    "eam_cuzr": {
+        "kind": "eam_fs",
+        "path": "models/eam/cuzr_eam.fs",
+        "description": "Cu-Zr_4.eam.fs EAM/FS reference potential",
+    },
+}
+
+
 @dataclass
 class RunConfig:
     run_name: str
     run_dir: str
     preset: str
+    model_alias: str
     model_kind: str
     model_file: str
     natoms: int
@@ -212,16 +229,16 @@ def write_initial_data(
     }
 
 
-def potential_block(model_kind: Literal["mace", "eam"], model_file: Path) -> str:
+def potential_block(model_kind: str, model_file: Path) -> str:
     model_file = model_file.resolve()
     if model_kind == "mace":
         return f"""# MACE via LAMMPS ML-IAP unified interface
 pair_style      mliap unified {model_file} 0
 pair_coeff      * * Cu Zr
 """
-    if model_kind == "eam":
-        return f"""# EAM baseline
-pair_style      eam/alloy
+    if model_kind in {"eam_fs", "eam"}:
+        return f"""# EAM/FS baseline
+pair_style      eam/fs
 pair_coeff      * * {model_file} Cu Zr
 """
     raise ValueError(f"Unsupported model_kind: {model_kind}")
@@ -321,10 +338,9 @@ def write_mddms_input(run_dir: Path, cfg: RunConfig, preset: Preset) -> None:
         atomic_dump = f"""
 # Atomic-level stress output.
 # c_atomstress[4] is the xy component of LAMMPS stress/atom.
-# c_atomvol[1] is Voronoi volume. Later analysis may use -c_atomstress[4]/c_atomvol[1].
+# This first pilot does not require the LAMMPS VORONOI package.
 compute         atomstress all stress/atom NULL
-compute         atomvol all voronoi/atom
-dump            atomdump all custom {preset.dump_every_steps} atom_stress.lammpstrj id type x y z c_atomstress[4] c_atomvol[1]
+dump            atomdump all custom {preset.dump_every_steps} atom_stress.lammpstrj id type x y z c_atomstress[4]
 dump_modify     atomdump sort id
 """
 
@@ -415,8 +431,8 @@ def write_run_shell_script(run_dir: Path, cfg: RunConfig) -> None:
 
 def default_lmp_command(model_kind: str) -> str:
     if model_kind == "mace":
-        return "lmp -k on g 1 -sf kk -pk kokkos newton on neigh half"
-    return "lmp"
+        return os.environ.get("LMP_MACE_KOKKOS_CMD", "lmp -k on g 1 -sf kk -pk kokkos newton on neigh half")
+    return os.environ.get("LMP_EAM_CMD", "lmp")
 
 
 def run_lammps_stage(run_dir: Path, input_file: str, lmp_command: str) -> None:
@@ -598,6 +614,35 @@ def generate_run(cfg: RunConfig) -> None:
         print(f"  - {run_dir / name}")
 
 
+def project_path(path_like: str | Path) -> Path:
+    path = Path(path_like).expanduser()
+    if path.is_absolute():
+        return path
+    return (REPO_ROOT / path).resolve()
+
+
+def print_model_aliases() -> None:
+    print("Available model aliases:")
+    for alias, info in MODEL_ALIASES.items():
+        path = project_path(info["path"])
+        status = "OK" if path.exists() else "missing"
+        print(f"  {alias:10s} kind={info['kind']:7s} status={status:7s} path={path}")
+        print(f"             {info['description']}")
+
+
+def resolve_model(model_alias: str, model_kind: str | None, model_file: str | None) -> tuple[str, Path, str]:
+    if model_alias == "custom":
+        if not model_kind or not model_file:
+            raise ValueError("--model-alias custom requires --model-kind and --model-file")
+        return model_kind, project_path(model_file), "custom model"
+
+    if model_alias not in MODEL_ALIASES:
+        raise ValueError(f"Unknown model alias {model_alias!r}. Available: {sorted(MODEL_ALIASES)}")
+
+    info = MODEL_ALIASES[model_alias]
+    return info["kind"], project_path(info["path"]), info["description"]
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Generate and optionally run a Cu-Zr MD-DMS pilot workflow.",
@@ -608,12 +653,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-root", default="runs")
     p.add_argument("--preset", choices=sorted(PRESETS), default="pilot")
 
-    p.add_argument("--model-kind", choices=["mace", "eam"], default="mace")
+    p.add_argument(
+        "--model-alias",
+        choices=sorted(MODEL_ALIASES) + ["custom"],
+        default="mace_c",
+        help="Runtime model alias prepared by scripts/cloud/startup_mddms_runtime.sh.",
+    )
+    p.add_argument(
+        "--model-kind",
+        choices=["mace", "eam_fs"],
+        default=None,
+        help="Usually inferred from --model-alias. Required only for --model-alias custom.",
+    )
     p.add_argument(
         "--model-file",
-        default="models/mace/mace_C.model-mliap_lammps.pt",
-        help="MACE ML-IAP .pt file or EAM .alloy file.",
+        default=None,
+        help="Usually inferred from --model-alias. For custom: MACE ML-IAP .pt or EAM/FS .fs file.",
     )
+    p.add_argument("--list-models", action="store_true", help="List known model aliases and exit.")
 
     p.add_argument("--natoms", type=int, default=4000)
     p.add_argument("--cu-fraction", type=float, default=0.64)
@@ -632,7 +689,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dump-atomic",
         action="store_true",
-        help="Dump per-atom xy stress and Voronoi volume during MD-DMS. Can create large files.",
+        help="Dump per-atom xy stress during MD-DMS. Can create large files.",
     )
     p.add_argument(
         "--stress-sign",
@@ -655,15 +712,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Iterable[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
-    lmp_command = args.lmp_command or default_lmp_command(args.model_kind)
+    if args.list_models:
+        print_model_aliases()
+        return 0
+
+    model_kind, model_file, description = resolve_model(args.model_alias, args.model_kind, args.model_file)
+    lmp_command = args.lmp_command or default_lmp_command(model_kind)
     run_dir = str(Path(args.run_root) / args.run_name)
+
+    print(f"[model] alias={args.model_alias} kind={model_kind}")
+    print(f"[model] file={model_file}")
+    print(f"[model] {description}")
+    print(f"[lammps] command={lmp_command}")
 
     cfg = RunConfig(
         run_name=args.run_name,
         run_dir=run_dir,
         preset=args.preset,
-        model_kind=args.model_kind,
-        model_file=args.model_file,
+        model_alias=args.model_alias,
+        model_kind=model_kind,
+        model_file=str(model_file),
         natoms=args.natoms,
         cu_fraction=args.cu_fraction,
         density_g_cm3=args.density_g_cm3,
