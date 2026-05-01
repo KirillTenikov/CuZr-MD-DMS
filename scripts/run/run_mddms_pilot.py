@@ -35,7 +35,7 @@ import random
 import shlex
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -90,6 +90,20 @@ PRESETS: dict[str, Preset] = {
         dump_every_steps=1000,
     ),
     # Thesis Chapter 3-like baseline. Expensive with MACE.
+    # Stronger but still manageable protocol for preparing lower-pressure glasses.
+    # Intended as a production-quality probe, not a full thesis-style protocol.
+    "pressure_relaxed": Preset(
+        name="pressure_relaxed",
+        melt_ps=20.0,
+        quench_rate_K_per_ps=135.0,  # 3000 -> 300 K in 20 ps
+        relax_ps=50.0,
+        equilibrate_ps=50.0,
+        mddms_period_ps=10.0,
+        mddms_cycles=6,
+        thermo_every_steps=500,
+        stress_every_steps=20,
+        dump_every_steps=1000,
+    ),
     "ch3": Preset(
         name="ch3",
         melt_ps=1000.0,
@@ -638,6 +652,140 @@ def project_path(path_like: str | Path) -> Path:
     return (REPO_ROOT / path).resolve()
 
 
+def parse_lammps_thermo_table(log_path: Path) -> list[dict[str, float]]:
+    """Parse simple LAMMPS thermo tables from a log file."""
+    rows: list[dict[str, float]] = []
+    headers: list[str] | None = None
+
+    for raw in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split()
+
+        if parts and parts[0] == "Step":
+            headers = parts
+            continue
+
+        if headers is None or len(parts) < len(headers):
+            continue
+
+        try:
+            values = [float(x) for x in parts[: len(headers)]]
+        except ValueError:
+            continue
+
+        rows.append(dict(zip(headers, values)))
+
+    return rows
+
+
+def summarize_lammps_pressure(
+    run_dir: Path,
+    tail_fraction: float = 0.25,
+    target_abs_mean_bar: float = 1000.0,
+) -> dict:
+    """Summarize pressure behavior from LAMMPS stage logs."""
+    import statistics
+
+    tail_fraction = min(max(tail_fraction, 0.01), 1.0)
+    stage_logs = [
+        "00_prepare_melt_quench.log",
+        "01_relax_npt.log",
+        "02_equilibrate_nvt.log",
+        "03_mddms_shear.log",
+    ]
+
+    summary: dict[str, object] = {
+        "run_dir": str(run_dir.resolve()),
+        "tail_fraction": tail_fraction,
+        "target_abs_mean_bar": target_abs_mean_bar,
+        "stages": {},
+    }
+
+    for name in stage_logs:
+        path = run_dir / name
+        if not path.exists():
+            summary["stages"][name] = {"exists": False}
+            continue
+
+        rows = parse_lammps_thermo_table(path)
+        if not rows:
+            summary["stages"][name] = {"exists": True, "n_rows": 0}
+            continue
+
+        n_tail = max(1, int(round(len(rows) * tail_fraction)))
+        tail = rows[-n_tail:]
+
+        stage: dict[str, object] = {
+            "exists": True,
+            "n_rows": len(rows),
+            "n_tail": n_tail,
+            "first_step": rows[0].get("Step"),
+            "last_step": rows[-1].get("Step"),
+            "first_time_ps": rows[0].get("Time"),
+            "last_time_ps": rows[-1].get("Time"),
+        }
+
+        for key in ["Temp", "Press", "Pxx", "Pyy", "Pzz", "Pxy", "Lx", "Ly", "Lz", "Xy"]:
+            values = [r[key] for r in tail if key in r]
+            if not values:
+                continue
+            mean = statistics.fmean(values)
+            std = statistics.pstdev(values) if len(values) > 1 else 0.0
+            stage[key] = {
+                "tail_mean": mean,
+                "tail_std": std,
+                "tail_min": min(values),
+                "tail_max": max(values),
+            }
+
+        press_info = stage.get("Press")
+        if isinstance(press_info, dict) and "tail_mean" in press_info:
+            mean_press = float(press_info["tail_mean"])
+            stage["pressure_acceptance"] = {
+                "abs_tail_mean_bar": abs(mean_press),
+                "target_abs_mean_bar": target_abs_mean_bar,
+                "passes_target": abs(mean_press) <= target_abs_mean_bar,
+            }
+
+        summary["stages"][name] = stage
+
+    return summary
+
+
+def write_pressure_summary(
+    run_dir: Path,
+    tail_fraction: float = 0.25,
+    target_abs_mean_bar: float = 1000.0,
+) -> Path:
+    summary = summarize_lammps_pressure(
+        run_dir=run_dir,
+        tail_fraction=tail_fraction,
+        target_abs_mean_bar=target_abs_mean_bar,
+    )
+    out = run_dir / "pressure_summary.json"
+    out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"[ok] Wrote pressure summary: {out}")
+
+    for stage_name, stage in summary.get("stages", {}).items():
+        if not isinstance(stage, dict) or not stage.get("exists"):
+            continue
+        press = stage.get("Press")
+        if isinstance(press, dict) and press.get("tail_mean") is not None:
+            mean = float(press["tail_mean"])
+            std = float(press.get("tail_std", 0.0))
+            acc = stage.get("pressure_acceptance", {})
+            passes = acc.get("passes_target") if isinstance(acc, dict) else None
+            print(
+                f"[pressure] {stage_name}: "
+                f"tail mean Press={mean:.3f} bar, std={std:.3f} bar, target pass={passes}"
+            )
+
+    return out
+
+
+
 def save_artifacts(run_dir: Path, artifact_root: Path, run_name: str, run_label: str) -> Path:
     """Copy key outputs to a labeled results folder.
 
@@ -719,6 +867,33 @@ Notes:
 
 
 
+def build_effective_preset(args: argparse.Namespace) -> Preset:
+    base = PRESETS[args.preset]
+    updates: dict[str, object] = {}
+
+    mapping = {
+        "melt_ps": args.melt_ps,
+        "quench_rate_K_per_ps": args.quench_rate_K_per_ps,
+        "relax_ps": args.relax_ps,
+        "equilibrate_ps": args.equilibrate_ps,
+        "mddms_period_ps": args.mddms_period_ps,
+        "mddms_cycles": args.mddms_cycles,
+        "thermo_every_steps": args.thermo_every_steps,
+        "stress_every_steps": args.stress_every_steps,
+    }
+
+    for key, value in mapping.items():
+        if value is not None:
+            updates[key] = value
+
+    if updates:
+        updates["name"] = f"{base.name}_{args.preset_name_suffix}"
+        return replace(base, **updates)
+
+    return base
+
+
+
 def print_model_aliases() -> None:
     print("Available model aliases:")
     for alias, info in MODEL_ALIASES.items():
@@ -750,6 +925,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-name", default="pilot_001")
     p.add_argument("--run-root", default="runs")
     p.add_argument("--preset", choices=sorted(PRESETS), default="pilot")
+
+    # Optional protocol overrides. These let us strengthen relaxation without
+    # creating a new hard-coded preset for every experiment.
+    p.add_argument("--melt-ps", type=float, default=None)
+    p.add_argument("--quench-rate-K-per-ps", type=float, default=None)
+    p.add_argument("--relax-ps", type=float, default=None)
+    p.add_argument("--equilibrate-ps", type=float, default=None)
+    p.add_argument("--mddms-period-ps", type=float, default=None)
+    p.add_argument("--mddms-cycles", type=int, default=None)
+    p.add_argument("--thermo-every-steps", type=int, default=None)
+    p.add_argument("--stress-every-steps", type=int, default=None)
+    p.add_argument("--preset-name-suffix", default="custom")
 
     p.add_argument(
         "--model-alias",
@@ -828,6 +1015,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--execute", action="store_true", help="Actually run LAMMPS stages after generating files.")
     p.add_argument("--analyze", action="store_true", help="Fit stress_timeseries.dat after execution or existing run.")
+    p.add_argument(
+        "--pressure-summary",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write pressure_summary.json from LAMMPS logs when possible.",
+    )
+    p.add_argument(
+        "--pressure-tail-fraction",
+        type=float,
+        default=0.25,
+        help="Fraction of the end of each thermo log used for pressure summary.",
+    )
+    p.add_argument(
+        "--pressure-target-bar",
+        type=float,
+        default=1000.0,
+        help="Reference target for absolute tail-mean pressure in bar.",
+    )
 
     return p
 
@@ -839,6 +1044,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         print_model_aliases()
         return 0
 
+    effective_preset = build_effective_preset(args)
+
     model_kind, model_file, description = resolve_model(args.model_alias, args.model_kind, args.model_file)
     lmp_command = args.lmp_command or default_lmp_command(model_kind)
     run_dir = str(Path(args.run_root) / args.run_name)
@@ -846,6 +1053,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     print(f"[model] alias={args.model_alias} kind={model_kind}")
     print(f"[model] file={model_file}")
     print(f"[model] {description}")
+    print(f"[preset] requested={args.preset} effective={effective_preset.name}")
+    print(f"[preset] {asdict(effective_preset)}")
     print(f"[lammps] command={lmp_command}")
 
     cfg = RunConfig(
@@ -881,8 +1090,15 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.execute:
         execute_stages(run_dir_path, cfg)
 
+    if args.pressure_summary:
+        write_pressure_summary(
+            run_dir=run_dir_path,
+            tail_fraction=args.pressure_tail_fraction,
+            target_abs_mean_bar=args.pressure_target_bar,
+        )
+
     if args.analyze:
-        preset = PRESETS[cfg.preset]
+        preset = effective_preset
         stress_file = run_dir_path / "stress_timeseries.dat"
         if not stress_file.exists():
             raise FileNotFoundError(f"Cannot analyze: missing {stress_file}")
