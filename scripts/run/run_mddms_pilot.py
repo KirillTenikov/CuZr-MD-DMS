@@ -1,50 +1,53 @@
 #!/usr/bin/env python3
 """
-CuZr-MD-DMS pilot runner.
+CuZr-MD-DMS pilot/production runner.
 
-This script is the first "working horse" for the Paper 2 MD-DMS workflow.
+Fixed version for Paper 2 production runs.
 
-It can:
-  1. generate a Cu-Zr initial LAMMPS data file,
-  2. generate LAMMPS inputs for:
-       00_prepare_melt_quench
-       01_relax_npt
-       02_equilibrate_nvt
-       03_mddms_shear
-  3. optionally execute the stages with LAMMPS,
-  4. optionally fit the system stress response and extract G', G''.
+Main fixes relative to the buggy override behavior:
+- Command-line preset overrides are collected into an effective Preset.
+- The effective Preset is used for generation, execution analysis, and metadata.
+- Period/cycle overrides therefore affect 03_mddms_shear.in and mddms_fit.json.
+- OVITO trajectory and atomic-stress dump flags are explicit and recorded in metadata.
 
-Design choices:
-  - No pyiron.
-  - Python controls workflow.
-  - LAMMPS input files are generated and saved for reproducibility.
-  - MACE is used through LAMMPS ML-IAP unified interface.
-  - EAM is also supported for baseline/sanity runs.
+Typical true production generation/execution:
 
-This first version is intended for technical pilots.
-Do not treat the default "pilot" preset as final production science.
+  python scripts/run/run_mddms_pilot.py \
+    --run-name prod_mace_c_4000_h100_seed42_T300_period50_cyc6_true_001 \
+    --preset pressure_relaxed \
+    --model-alias mace_c \
+    --natoms 4000 \
+    --seed 42 \
+    --mddms-period-ps 50 \
+    --mddms-cycles 6 \
+    --dump-trajectory \
+    --dump-atomic-stress \
+    --dump-every-steps 1000 \
+    --execute \
+    --analyze \
+    --save-artifacts
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import random
+import re
 import shlex
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
 
 AMU_TO_G = 1.66053906660e-24
 CM3_TO_A3 = 1.0e24
 CU_MASS = 63.546
 ZR_MASS = 91.224
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -62,12 +65,10 @@ class Preset:
 
 
 PRESETS: dict[str, Preset] = {
-    # Very small sanity run: checks that LAMMPS, potential, deformation,
-    # and output mechanics work. Not physically meaningful.
     "tiny": Preset(
         name="tiny",
         melt_ps=1.0,
-        quench_rate_K_per_ps=2700.0,  # 3000 -> 300 K in 1 ps
+        quench_rate_K_per_ps=2700.0,
         relax_ps=1.0,
         equilibrate_ps=1.0,
         mddms_period_ps=1.0,
@@ -76,11 +77,10 @@ PRESETS: dict[str, Preset] = {
         stress_every_steps=10,
         dump_every_steps=100,
     ),
-    # Practical first cloud test.
     "pilot": Preset(
         name="pilot",
         melt_ps=20.0,
-        quench_rate_K_per_ps=135.0,  # 3000 -> 300 K in 20 ps
+        quench_rate_K_per_ps=135.0,
         relax_ps=10.0,
         equilibrate_ps=10.0,
         mddms_period_ps=10.0,
@@ -89,13 +89,10 @@ PRESETS: dict[str, Preset] = {
         stress_every_steps=20,
         dump_every_steps=1000,
     ),
-    # Thesis Chapter 3-like baseline. Expensive with MACE.
-    # Stronger but still manageable protocol for preparing lower-pressure glasses.
-    # Intended as a production-quality probe, not a full thesis-style protocol.
     "pressure_relaxed": Preset(
         name="pressure_relaxed",
         melt_ps=20.0,
-        quench_rate_K_per_ps=135.0,  # 3000 -> 300 K in 20 ps
+        quench_rate_K_per_ps=135.0,
         relax_ps=50.0,
         equilibrate_ps=50.0,
         mddms_period_ps=10.0,
@@ -107,7 +104,7 @@ PRESETS: dict[str, Preset] = {
     "ch3": Preset(
         name="ch3",
         melt_ps=1000.0,
-        quench_rate_K_per_ps=1.0,    # 3000 -> 300 K in 2700 ps
+        quench_rate_K_per_ps=1.0,
         relax_ps=100.0,
         equilibrate_ps=0.0,
         mddms_period_ps=50.0,
@@ -118,17 +115,14 @@ PRESETS: dict[str, Preset] = {
     ),
 }
 
-
-MODEL_ALIASES: dict[str, dict[str, str]] = {
+MODEL_ALIASES = {
     "mace_c": {
-        "kind": "mace",
-        "path": "models/mace/mace_C.model-mliap_lammps.pt",
-        "description": "MACE_C converted to LAMMPS ML-IAP format",
+        "model_kind": "mace",
+        "model_file": "models/mace/MACE_C.model-mliap_lammps.pt",
     },
-    "eam_cuzr": {
-        "kind": "eam_fs",
-        "path": "models/eam/cuzr_eam.fs",
-        "description": "Cu-Zr_4.eam.fs EAM/FS reference potential",
+    "eam": {
+        "model_kind": "eam",
+        "model_file": "models/eam/cuzr_eam.fs",
     },
 }
 
@@ -138,7 +132,7 @@ class RunConfig:
     run_name: str
     run_dir: str
     preset: str
-    model_alias: str
+    model_alias: str | None
     model_kind: str
     model_file: str
     natoms: int
@@ -178,6 +172,31 @@ def estimate_box_length_a(n_cu: int, n_zr: int, density_g_cm3: float) -> float:
     return volume_a3 ** (1.0 / 3.0)
 
 
+def file_sha256(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def git_info(repo: Path) -> dict:
+    def run_git(args: list[str]) -> str | None:
+        try:
+            out = subprocess.check_output(["git", *args], cwd=repo, stderr=subprocess.DEVNULL, text=True)
+            return out.strip()
+        except Exception:
+            return None
+
+    return {
+        "commit": run_git(["rev-parse", "HEAD"]),
+        "branch": run_git(["branch", "--show-current"]),
+        "status_short": run_git(["status", "--short"]),
+    }
+
+
 def write_initial_data(
     path: Path,
     natoms: int,
@@ -185,16 +204,15 @@ def write_initial_data(
     density_g_cm3: float,
     seed: int,
 ) -> dict:
-    """Write a simple lattice-like random-alloy starting structure.
+    """Write a safe lattice-like random-alloy starting structure.
 
-    We intentionally avoid fully random positions because atom overlaps can
-    make the first MD steps unstable. The structure is not meant to be physical;
-    it will be melted and quenched.
+    We intentionally avoid fully random positions because atom overlaps can make
+    early MD unstable. The structure is not meant to be physical; it is melted
+    and quenched before measurement.
     """
     rng = random.Random(seed)
     n_cu, n_zr = composition_counts(natoms, cu_fraction)
     L = estimate_box_length_a(n_cu, n_zr, density_g_cm3)
-
     ngrid = math.ceil(natoms ** (1.0 / 3.0))
     spacing = L / ngrid
 
@@ -204,7 +222,6 @@ def write_initial_data(
             for iz in range(ngrid):
                 if len(positions) >= natoms:
                     break
-                # Small jitter avoids perfect symmetry but keeps distances safe.
                 jitter = 0.12 * spacing
                 x = (ix + 0.5) * spacing + rng.uniform(-jitter, jitter)
                 y = (iy + 0.5) * spacing + rng.uniform(-jitter, jitter)
@@ -246,33 +263,31 @@ def write_initial_data(
     }
 
 
-def potential_block(model_kind: str, model_file: Path) -> str:
+def potential_block(model_kind: Literal["mace", "eam"], model_file: Path) -> str:
     model_file = model_file.resolve()
     if model_kind == "mace":
         return f"""# MACE via LAMMPS ML-IAP unified interface
-pair_style      mliap unified {model_file} 0
-pair_coeff      * * Cu Zr
+pair_style mliap unified {model_file} 0
+pair_coeff * * Cu Zr
 """
-    if model_kind in {"eam_fs", "eam"}:
-        return f"""# EAM/FS baseline
-pair_style      eam/fs
-pair_coeff      * * {model_file} Cu Zr
+    if model_kind == "eam":
+        return f"""# EAM baseline
+pair_style eam/fs
+pair_coeff * * {model_file} Cu Zr
 """
     raise ValueError(f"Unsupported model_kind: {model_kind}")
 
 
 def common_header(data_file: str, model_kind: str, model_file: Path) -> str:
-    return f"""units           metal
-atom_style      atomic
-boundary        p p p
-newton          on
-
-read_data       {data_file}
+    return f"""units metal
+atom_style atomic
+boundary p p p
+newton on
+read_data {data_file}
 
 {potential_block(model_kind, model_file)}
-
-neighbor        2.0 bin
-neigh_modify    delay 0 every 1 check yes
+neighbor 2.0 bin
+neigh_modify delay 0 every 1 check yes
 """
 
 
@@ -280,28 +295,25 @@ def write_prepare_input(run_dir: Path, cfg: RunConfig, preset: Preset) -> None:
     melt_steps = ps_to_steps(preset.melt_ps, cfg.timestep_ps)
     quench_ps = (cfg.temperature_high_K - cfg.temperature_low_K) / preset.quench_rate_K_per_ps
     quench_steps = ps_to_steps(quench_ps, cfg.timestep_ps)
-
     text = f"""{common_header("initial.data", cfg.model_kind, Path(cfg.model_file))}
-timestep        {cfg.timestep_ps:.8f}
-
-thermo          {preset.thermo_every_steps}
-thermo_style    custom step time temp pe ke etotal press pxx pyy pzz pxy lx ly lz
+timestep {cfg.timestep_ps:.8f}
+thermo {preset.thermo_every_steps}
+thermo_style custom step time temp pe ke etotal press pxx pyy pzz pxy lx ly lz
 
 # Gentle cleanup before the high-temperature melt.
-minimize        1.0e-6 1.0e-8 1000 10000
+minimize 1.0e-6 1.0e-8 1000 10000
 
-velocity        all create {cfg.temperature_high_K:.6f} {cfg.seed + 101} mom yes rot yes dist gaussian
+velocity all create {cfg.temperature_high_K:.6f} {cfg.seed + 101} mom yes rot yes dist gaussian
+fix melt all nvt temp {cfg.temperature_high_K:.6f} {cfg.temperature_high_K:.6f} {cfg.tdamp_ps:.6f}
+run {melt_steps}
+unfix melt
 
-fix             melt all nvt temp {cfg.temperature_high_K:.6f} {cfg.temperature_high_K:.6f} {cfg.tdamp_ps:.6f}
-run             {melt_steps}
-unfix           melt
+fix quench all nvt temp {cfg.temperature_high_K:.6f} {cfg.temperature_low_K:.6f} {cfg.tdamp_ps:.6f}
+run {quench_steps}
+unfix quench
 
-fix             quench all nvt temp {cfg.temperature_high_K:.6f} {cfg.temperature_low_K:.6f} {cfg.tdamp_ps:.6f}
-run             {quench_steps}
-unfix           quench
-
-write_data      00_after_quench.data
-write_restart   00_after_quench.restart
+write_data 00_after_quench.data
+write_restart 00_after_quench.restart
 """
     (run_dir / "00_prepare_melt_quench.in").write_text(text, encoding="utf-8")
 
@@ -309,19 +321,17 @@ write_restart   00_after_quench.restart
 def write_relax_input(run_dir: Path, cfg: RunConfig, preset: Preset) -> None:
     relax_steps = ps_to_steps(preset.relax_ps, cfg.timestep_ps)
     text = f"""{common_header("00_after_quench.data", cfg.model_kind, Path(cfg.model_file))}
-timestep        {cfg.timestep_ps:.8f}
+timestep {cfg.timestep_ps:.8f}
+thermo {preset.thermo_every_steps}
+thermo_style custom step time temp pe ke etotal press pxx pyy pzz pxy lx ly lz
 
-thermo          {preset.thermo_every_steps}
-thermo_style    custom step time temp pe ke etotal press pxx pyy pzz pxy lx ly lz
+velocity all create {cfg.temperature_low_K:.6f} {cfg.seed + 202} mom yes rot yes dist gaussian
+fix relax all npt temp {cfg.temperature_low_K:.6f} {cfg.temperature_low_K:.6f} {cfg.tdamp_ps:.6f} iso {cfg.pressure_bar:.6f} {cfg.pressure_bar:.6f} {cfg.pdamp_ps:.6f}
+run {relax_steps}
+unfix relax
 
-velocity        all create {cfg.temperature_low_K:.6f} {cfg.seed + 202} mom yes rot yes dist gaussian
-
-fix             relax all npt temp {cfg.temperature_low_K:.6f} {cfg.temperature_low_K:.6f} {cfg.tdamp_ps:.6f} iso {cfg.pressure_bar:.6f} {cfg.pressure_bar:.6f} {cfg.pdamp_ps:.6f}
-run             {relax_steps}
-unfix           relax
-
-write_data      01_after_relax_npt.data
-write_restart   01_after_relax_npt.restart
+write_data 01_after_relax_npt.data
+write_restart 01_after_relax_npt.restart
 """
     (run_dir / "01_relax_npt.in").write_text(text, encoding="utf-8")
 
@@ -329,102 +339,100 @@ write_restart   01_after_relax_npt.restart
 def write_equilibrate_input(run_dir: Path, cfg: RunConfig, preset: Preset) -> None:
     eq_steps = ps_to_steps(preset.equilibrate_ps, cfg.timestep_ps)
     text = f"""{common_header("01_after_relax_npt.data", cfg.model_kind, Path(cfg.model_file))}
-timestep        {cfg.timestep_ps:.8f}
+timestep {cfg.timestep_ps:.8f}
+thermo {preset.thermo_every_steps}
+thermo_style custom step time temp pe ke etotal press pxx pyy pzz pxy lx ly lz
 
-thermo          {preset.thermo_every_steps}
-thermo_style    custom step time temp pe ke etotal press pxx pyy pzz pxy lx ly lz
+velocity all create {cfg.temperature_low_K:.6f} {cfg.seed + 303} mom yes rot yes dist gaussian
+fix eq all nvt temp {cfg.temperature_low_K:.6f} {cfg.temperature_low_K:.6f} {cfg.tdamp_ps:.6f}
+run {eq_steps}
+unfix eq
 
-velocity        all create {cfg.temperature_low_K:.6f} {cfg.seed + 303} mom yes rot yes dist gaussian
-
-fix             eq all nvt temp {cfg.temperature_low_K:.6f} {cfg.temperature_low_K:.6f} {cfg.tdamp_ps:.6f}
-run             {eq_steps}
-unfix           eq
-
-write_data      02_after_equilibrate_nvt.data
-write_restart   02_after_equilibrate_nvt.restart
+write_data 02_after_equilibrate_nvt.data
+write_restart 02_after_equilibrate_nvt.restart
 """
     (run_dir / "02_equilibrate_nvt.in").write_text(text, encoding="utf-8")
 
 
 def write_mddms_input(run_dir: Path, cfg: RunConfig, preset: Preset) -> None:
-    mddms_steps = ps_to_steps(preset.mddms_period_ps * preset.mddms_cycles, cfg.timestep_ps)
+    mddms_ps = preset.mddms_period_ps * preset.mddms_cycles
+    mddms_steps = ps_to_steps(mddms_ps, cfg.timestep_ps)
     dump_every = cfg.dump_every_steps or preset.dump_every_steps
 
     trajectory_dump = ""
     if cfg.dump_trajectory:
         trajectory_dump = f"""
-# OVITO-friendly structural trajectory.
-# id/type are required for consistent particle tracking.
-# x/y/z plus image flags allow reconstruction of wrapped/unwrapped motion.
-dump            trajdump all custom {dump_every} trajectory.lammpstrj id type x y z ix iy iz
-dump_modify     trajdump sort id
+# OVITO trajectory output.
+dump traj all custom {dump_every} trajectory.lammpstrj id type x y z ix iy iz
+dump_modify traj sort id
 """
 
     atomic_dump = ""
     if cfg.dump_atomic:
-        if cfg.dump_voronoi:
-            atomic_dump = f"""
-# Atomic stress plus Voronoi volume output for selected local-response runs.
-# Requires LAMMPS VORONOI package.
-compute         atomstress all stress/atom NULL
-compute         atomvol all voronoi/atom
-dump            stressdump all custom {dump_every} atom_stress.lammpstrj id type x y z ix iy iz c_atomstress[1] c_atomstress[2] c_atomstress[3] c_atomstress[4] c_atomstress[5] c_atomstress[6] c_atomvol[1]
-dump_modify     stressdump sort id
+        atomic_dump = f"""
+# Atomic-level stress output for OVITO/local analysis.
+# LAMMPS stress/atom has pressure*volume units; post-processing must choose sign and normalization.
+compute atomstress all stress/atom NULL
+dump astress all custom {dump_every} atom_stress.lammpstrj id type x y z ix iy iz c_atomstress[1] c_atomstress[2] c_atomstress[3] c_atomstress[4] c_atomstress[5] c_atomstress[6]
+dump_modify astress sort id
 """
-        else:
-            atomic_dump = f"""
-# Atomic stress output for selected local-response runs.
-# c_atomstress[4] is the xy component relevant for xy shear.
-compute         atomstress all stress/atom NULL
-dump            stressdump all custom {dump_every} atom_stress.lammpstrj id type x y z ix iy iz c_atomstress[1] c_atomstress[2] c_atomstress[3] c_atomstress[4] c_atomstress[5] c_atomstress[6]
-dump_modify     stressdump sort id
+
+    voronoi_dump = ""
+    if cfg.dump_voronoi:
+        voronoi_dump = f"""
+# Optional Voronoi volume output. Requires LAMMPS VORONOI package.
+compute atomvol all voronoi/atom
+dump voro all custom {dump_every} atom_voronoi.lammpstrj id type x y z ix iy iz c_atomvol[1]
+dump_modify voro sort id
 """
 
     text = f"""{common_header("02_after_equilibrate_nvt.data", cfg.model_kind, Path(cfg.model_file))}
-timestep        {cfg.timestep_ps:.8f}
+timestep {cfg.timestep_ps:.8f}
 
-change_box      all triclinic
+# The box must be triclinic before applying xy shear.
+change_box all triclinic
+reset_timestep 0
 
-reset_timestep  0
-velocity        all create {cfg.temperature_low_K:.6f} {cfg.seed + 404} mom yes rot yes dist gaussian
+velocity all create {cfg.temperature_low_K:.6f} {cfg.seed + 404} mom yes rot yes dist gaussian
 
-thermo          {preset.thermo_every_steps}
-thermo_style    custom step time temp pe ke etotal press pxx pyy pzz pxy lx ly lz xy
+thermo {preset.thermo_every_steps}
+thermo_style custom step time temp pe ke etotal press pxx pyy pzz pxy lx ly lz xy
 
-variable        gamma0 equal {cfg.strain_amplitude:.12f}
-variable        period equal {preset.mddms_period_ps:.12f}
-variable        omega equal 2.0*{math.pi:.16f}/v_period
-variable        gamma equal v_gamma0*sin(v_omega*time)
-variable        gammadot equal v_gamma0*v_omega*cos(v_omega*time)
-variable        xy_target equal v_gamma*ly
-variable        xy_rate equal v_gammadot*ly
+# Sinusoidal shear strain:
+# gamma(t) = gamma0 * sin(2*pi*t/T)
+# LAMMPS xy tilt has units of length, so xy(t) = gamma(t) * Ly.
+variable gamma0 equal {cfg.strain_amplitude:.12f}
+variable period equal {preset.mddms_period_ps:.12f}
+variable omega equal 2.0*{math.pi:.16f}/v_period
+variable gamma equal v_gamma0*sin(v_omega*time)
+variable gammadot equal v_gamma0*v_omega*cos(v_omega*time)
+variable xy_target equal v_gamma*ly
+variable xy_rate equal v_gammadot*ly
 
-fix             thermostat all nvt temp {cfg.temperature_low_K:.6f} {cfg.temperature_low_K:.6f} {cfg.tdamp_ps:.6f}
-fix             deform all deform 1 xy variable v_xy_target v_xy_rate remap x
+# Thermostat during small-amplitude oscillatory shear.
+fix thermostat all nvt temp {cfg.temperature_low_K:.6f} {cfg.temperature_low_K:.6f} {cfg.tdamp_ps:.6f}
+fix deform all deform 1 xy variable v_xy_target v_xy_rate remap x
 
-variable        time_ps equal time
-variable        pxy_bar equal pxy
-variable        temp_K equal temp
-variable        pe_eV equal pe
-variable        ke_eV equal ke
-variable        press_bar equal press
-variable        xy_A equal xy
-variable        ly_A equal ly
+# System-level time series.
+variable time_ps equal time
+variable pxy_bar equal pxy
+variable temp_K equal temp
+variable pe_eV equal pe
+variable ke_eV equal ke
+variable press_bar equal press
+variable xy_A equal xy
+variable ly_A equal ly
+fix ts all ave/time {preset.stress_every_steps} 1 {preset.stress_every_steps} v_time_ps v_gamma v_pxy_bar v_temp_K v_pe_eV v_ke_eV v_press_bar v_xy_A v_ly_A file stress_timeseries.dat
+{trajectory_dump}{atomic_dump}{voronoi_dump}
+run {mddms_steps}
 
-fix             ts all ave/time {preset.stress_every_steps} 1 {preset.stress_every_steps} v_time_ps v_gamma v_pxy_bar v_temp_K v_pe_eV v_ke_eV v_press_bar v_xy_A v_ly_A file stress_timeseries.dat
-{trajectory_dump}
-{atomic_dump}
-run             {mddms_steps}
-
-unfix           ts
-unfix           deform
-unfix           thermostat
-
-write_data      03_after_mddms.data
-write_restart   03_after_mddms.restart
+unfix ts
+unfix deform
+unfix thermostat
+write_data 03_after_mddms.data
+write_restart 03_after_mddms.restart
 """
     (run_dir / "03_mddms_shear.in").write_text(text, encoding="utf-8")
-
 
 
 def write_run_shell_script(run_dir: Path, cfg: RunConfig) -> None:
@@ -441,6 +449,9 @@ def write_run_shell_script(run_dir: Path, cfg: RunConfig) -> None:
         "source /opt/venv/bin/activate || true",
         "if [ -f /workspace/cuzr_mddms_runtime.env ]; then",
         "  source /workspace/cuzr_mddms_runtime.env",
+        "fi",
+        "if [ -f /workspace/cuzr_runtime.env ]; then",
+        "  source /workspace/cuzr_runtime.env",
         "fi",
         "",
         f"LMP_CMD={shlex.quote(cfg.lmp_command)}",
@@ -462,8 +473,8 @@ def write_run_shell_script(run_dir: Path, cfg: RunConfig) -> None:
 
 def default_lmp_command(model_kind: str) -> str:
     if model_kind == "mace":
-        return os.environ.get("LMP_MACE_KOKKOS_CMD", "lmp -k on g 1 -sf kk -pk kokkos newton on neigh half")
-    return os.environ.get("LMP_EAM_CMD", "lmp")
+        return "lmp -k on g 1 -sf kk -pk kokkos newton on neigh half"
+    return "lmp"
 
 
 def run_lammps_stage(run_dir: Path, input_file: str, lmp_command: str) -> None:
@@ -486,11 +497,6 @@ def execute_stages(run_dir: Path, cfg: RunConfig) -> None:
 
 
 def parse_fix_ave_time(path: Path) -> tuple[list[str], list[list[float]]]:
-    """Parse LAMMPS fix ave/time file.
-
-    Expected data columns:
-      timestep time_ps gamma pxy_bar temp_K pe_eV ke_eV press_bar xy_A ly_A
-    """
     rows: list[list[float]] = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
@@ -501,7 +507,6 @@ def parse_fix_ave_time(path: Path) -> tuple[list[str], list[list[float]]]:
             rows.append([float(x) for x in parts])
         except ValueError:
             continue
-
     columns = [
         "timestep",
         "time_ps",
@@ -534,23 +539,17 @@ def fit_mddms_response(
     gamma = arr[:, 2]
     pxy_bar = arr[:, 3]
 
-    # Convert bar to GPa. Sign is configurable because LAMMPS pressure tensor
-    # sign conventions can be opposite to engineering stress conventions.
     stress_gpa = stress_sign * pxy_bar * 1.0e-4
-
     omega = 2.0 * math.pi / period_ps
     sin_t = np.sin(omega * time_ps)
     cos_t = np.cos(omega * time_ps)
     X = np.column_stack([sin_t, cos_t, np.ones_like(time_ps)])
-
     coeff, *_ = np.linalg.lstsq(X, stress_gpa, rcond=None)
     a_sin, b_cos, offset = coeff
 
     stress_amp_gpa = float(math.sqrt(a_sin * a_sin + b_cos * b_cos))
     phase_rad = float(math.atan2(b_cos, a_sin))
 
-    # If gamma(t)=gamma0*sin(wt), then stress=sigma0*sin(wt+delta).
-    # G' = sigma0/gamma0 cos(delta), G'' = sigma0/gamma0 sin(delta).
     g_storage_gpa = float((stress_amp_gpa / strain_amplitude) * math.cos(phase_rad))
     g_loss_gpa = float((stress_amp_gpa / strain_amplitude) * math.sin(phase_rad))
 
@@ -571,6 +570,7 @@ def fit_mddms_response(
         "stress_amplitude_GPa": stress_amp_gpa,
         "phase_rad": phase_rad,
         "phase_deg": float(phase_rad * 180.0 / math.pi),
+        "tan_delta": float(g_loss_gpa / g_storage_gpa) if g_storage_gpa != 0 else None,
         "G_storage_GPa": g_storage_gpa,
         "G_loss_GPa": g_loss_gpa,
         "rmse_GPa": rmse_gpa,
@@ -580,18 +580,149 @@ def fit_mddms_response(
     }
 
 
-def generate_run(cfg: RunConfig) -> None:
+def parse_thermo_log(path: Path) -> tuple[list[str], list[list[float]]]:
+    """Best-effort parser for LAMMPS thermo tables."""
+    if not path.exists():
+        return [], []
+
+    rows: list[list[float]] = []
+    header: list[str] = []
+    active_header: list[str] = []
+
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if parts and parts[0] == "Step" and any(p.lower() == "press" for p in parts):
+            active_header = parts
+            header = parts
+            continue
+        if not active_header:
+            continue
+        try:
+            vals = [float(x) for x in parts]
+        except ValueError:
+            continue
+        if len(vals) == len(active_header):
+            rows.append(vals)
+
+    return header, rows
+
+
+def summarize_numeric_column(header: list[str], rows: list[list[float]], name: str) -> dict | None:
+    if not header or not rows or name not in header:
+        return None
+    import numpy as np
+
+    idx = header.index(name)
+    arr = np.asarray([row[idx] for row in rows], dtype=float)
+    n_tail = max(1, min(len(arr), len(arr) // 5 if len(arr) >= 5 else len(arr)))
+    tail = arr[-n_tail:]
+    return {
+        "n_rows": int(len(arr)),
+        "final": float(arr[-1]),
+        "mean": float(np.mean(arr)),
+        "tail_mean": float(np.mean(tail)),
+        "tail_std": float(np.std(tail)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+    }
+
+
+def write_pressure_summary(run_dir: Path) -> dict:
+    summary: dict[str, dict] = {}
+    for log_name in [
+        "00_prepare_melt_quench.log",
+        "01_relax_npt.log",
+        "02_equilibrate_nvt.log",
+        "03_mddms_shear.log",
+    ]:
+        path = run_dir / log_name
+        header, rows = parse_thermo_log(path)
+        if not rows:
+            continue
+        summary[log_name] = {
+            "columns": header,
+            "pressure_bar": summarize_numeric_column(header, rows, "Press"),
+            "temperature_K": summarize_numeric_column(header, rows, "Temp"),
+        }
+        for col in ["Pxx", "Pyy", "Pzz", "Pxy", "Lx", "Ly", "Lz"]:
+            val = summarize_numeric_column(header, rows, col)
+            if val is not None:
+                summary[log_name][col] = val
+
+    # MD-DMS stress time series pressure column, if present.
+    stress_file = run_dir / "stress_timeseries.dat"
+    if stress_file.exists():
+        try:
+            columns, rows = parse_fix_ave_time(stress_file)
+            if rows:
+                import numpy as np
+
+                arr = np.asarray(rows, dtype=float)
+                press = arr[:, 6]
+                n_tail = max(1, min(len(press), len(press) // 5 if len(press) >= 5 else len(press)))
+                tail = press[-n_tail:]
+                summary["stress_timeseries.dat"] = {
+                    "pressure_bar": {
+                        "n_rows": int(len(press)),
+                        "final": float(press[-1]),
+                        "mean": float(np.mean(press)),
+                        "tail_mean": float(np.mean(tail)),
+                        "tail_std": float(np.std(tail)),
+                        "min": float(np.min(press)),
+                        "max": float(np.max(press)),
+                    }
+                }
+        except Exception as exc:
+            summary["stress_timeseries.dat_error"] = {"error": repr(exc)}
+
+    out = {"run_dir": str(run_dir), "summary": summary}
+    (run_dir / "pressure_summary.json").write_text(json.dumps(out, indent=2), encoding="utf-8")
+    return out
+
+
+def build_effective_preset(args: argparse.Namespace) -> Preset:
+    base = PRESETS[args.preset]
+    changed = False
+
+    def pick(value, current):
+        nonlocal changed
+        if value is None:
+            return current
+        changed = True
+        return value
+
+    effective = Preset(
+        name=base.name,
+        melt_ps=float(pick(args.melt_ps, base.melt_ps)),
+        quench_rate_K_per_ps=float(pick(args.quench_rate_K_per_ps, base.quench_rate_K_per_ps)),
+        relax_ps=float(pick(args.relax_ps, base.relax_ps)),
+        equilibrate_ps=float(pick(args.equilibrate_ps, base.equilibrate_ps)),
+        mddms_period_ps=float(pick(args.mddms_period_ps, base.mddms_period_ps)),
+        mddms_cycles=int(pick(args.mddms_cycles, base.mddms_cycles)),
+        thermo_every_steps=int(pick(args.thermo_every_steps, base.thermo_every_steps)),
+        stress_every_steps=int(pick(args.stress_every_steps, base.stress_every_steps)),
+        dump_every_steps=int(pick(args.dump_every_steps, base.dump_every_steps)),
+    )
+
+    if changed:
+        return Preset(name=f"{base.name}_custom", **{k: v for k, v in asdict(effective).items() if k != "name"})
+    return effective
+
+
+def generate_run(cfg: RunConfig, preset: Preset) -> None:
     if cfg.preset not in PRESETS:
         raise ValueError(f"Unknown preset {cfg.preset!r}. Available: {sorted(PRESETS)}")
 
-    preset = PRESETS[cfg.preset]
     run_dir = Path(cfg.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
 
     model_file = Path(cfg.model_file)
     if not model_file.exists():
         print(f"[warning] Model file does not exist yet: {model_file}", file=sys.stderr)
-        print("[warning] This is okay if you are generating files locally before copying models on cloud.", file=sys.stderr)
+        print("[warning] This is okay if generating files before copying models on cloud.", file=sys.stderr)
 
     structure_meta = write_initial_data(
         run_dir / "initial.data",
@@ -600,7 +731,6 @@ def generate_run(cfg: RunConfig) -> None:
         cfg.density_g_cm3,
         cfg.seed,
     )
-
     write_prepare_input(run_dir, cfg, preset)
     write_relax_input(run_dir, cfg, preset)
     write_equilibrate_input(run_dir, cfg, preset)
@@ -608,9 +738,12 @@ def generate_run(cfg: RunConfig) -> None:
     write_run_shell_script(run_dir, cfg)
 
     quench_ps = (cfg.temperature_high_K - cfg.temperature_low_K) / preset.quench_rate_K_per_ps
+    script_path = Path(__file__).resolve()
+    repo_root = Path.cwd().resolve()
 
     metadata = {
         "run_config": asdict(cfg),
+        "base_preset_name": cfg.preset,
         "preset": asdict(preset),
         "derived": {
             "melt_steps": ps_to_steps(preset.melt_ps, cfg.timestep_ps),
@@ -622,16 +755,23 @@ def generate_run(cfg: RunConfig) -> None:
             "mddms_steps": ps_to_steps(preset.mddms_period_ps * preset.mddms_cycles, cfg.timestep_ps),
         },
         "initial_structure": structure_meta,
+        "reproducibility": {
+            "script_path": str(script_path),
+            "script_sha256": file_sha256(script_path),
+            "command_line": " ".join(shlex.quote(x) for x in sys.argv),
+            "git": git_info(repo_root),
+        },
         "notes": [
-            "This is a generated technical-pilot workflow.",
             "LAMMPS input files are saved for reproducibility.",
             "For MACE, this script assumes a converted ML-IAP model file: *-mliap_lammps.pt.",
-            "For production, validate thermostat/deformation settings and output cadence.",
+            "Effective preset overrides are applied before generation; metadata and .in files should agree.",
         ],
     }
     (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     print(f"[ok] Generated run directory: {run_dir}")
+    print("[ok] Effective preset:")
+    print(json.dumps(asdict(preset), indent=2))
     print("[ok] Main files:")
     for name in [
         "initial.data",
@@ -642,292 +782,56 @@ def generate_run(cfg: RunConfig) -> None:
         "run_lammps.sh",
         "metadata.json",
     ]:
-        print(f"  - {run_dir / name}")
+        print(f" - {run_dir / name}")
 
 
-def project_path(path_like: str | Path) -> Path:
-    path = Path(path_like).expanduser()
-    if path.is_absolute():
-        return path
-    return (REPO_ROOT / path).resolve()
+def resolve_model(args: argparse.Namespace) -> tuple[str | None, str, str]:
+    model_alias = args.model_alias
+    model_kind = args.model_kind
+    model_file = args.model_file
 
+    if model_alias:
+        if model_alias not in MODEL_ALIASES:
+            raise ValueError(f"Unknown model alias {model_alias!r}. Available: {sorted(MODEL_ALIASES)}")
+        alias = MODEL_ALIASES[model_alias]
+        if args.model_kind is None:
+            model_kind = alias["model_kind"]
+        if args.model_file is None:
+            model_file = alias["model_file"]
 
-def parse_lammps_thermo_table(log_path: Path) -> list[dict[str, float]]:
-    """Parse simple LAMMPS thermo tables from a log file."""
-    rows: list[dict[str, float]] = []
-    headers: list[str] | None = None
+    if model_kind is None:
+        model_kind = "mace"
+    if model_file is None:
+        model_file = "models/mace/MACE_C.model-mliap_lammps.pt"
 
-    for raw in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        parts = line.split()
-
-        if parts and parts[0] == "Step":
-            headers = parts
-            continue
-
-        if headers is None or len(parts) < len(headers):
-            continue
-
-        try:
-            values = [float(x) for x in parts[: len(headers)]]
-        except ValueError:
-            continue
-
-        rows.append(dict(zip(headers, values)))
-
-    return rows
-
-
-def summarize_lammps_pressure(
-    run_dir: Path,
-    tail_fraction: float = 0.25,
-    target_abs_mean_bar: float = 1000.0,
-) -> dict:
-    """Summarize pressure behavior from LAMMPS stage logs."""
-    import statistics
-
-    tail_fraction = min(max(tail_fraction, 0.01), 1.0)
-    stage_logs = [
-        "00_prepare_melt_quench.log",
-        "01_relax_npt.log",
-        "02_equilibrate_nvt.log",
-        "03_mddms_shear.log",
-    ]
-
-    summary: dict[str, object] = {
-        "run_dir": str(run_dir.resolve()),
-        "tail_fraction": tail_fraction,
-        "target_abs_mean_bar": target_abs_mean_bar,
-        "stages": {},
-    }
-
-    for name in stage_logs:
-        path = run_dir / name
-        if not path.exists():
-            summary["stages"][name] = {"exists": False}
-            continue
-
-        rows = parse_lammps_thermo_table(path)
-        if not rows:
-            summary["stages"][name] = {"exists": True, "n_rows": 0}
-            continue
-
-        n_tail = max(1, int(round(len(rows) * tail_fraction)))
-        tail = rows[-n_tail:]
-
-        stage: dict[str, object] = {
-            "exists": True,
-            "n_rows": len(rows),
-            "n_tail": n_tail,
-            "first_step": rows[0].get("Step"),
-            "last_step": rows[-1].get("Step"),
-            "first_time_ps": rows[0].get("Time"),
-            "last_time_ps": rows[-1].get("Time"),
-        }
-
-        for key in ["Temp", "Press", "Pxx", "Pyy", "Pzz", "Pxy", "Lx", "Ly", "Lz", "Xy"]:
-            values = [r[key] for r in tail if key in r]
-            if not values:
-                continue
-            mean = statistics.fmean(values)
-            std = statistics.pstdev(values) if len(values) > 1 else 0.0
-            stage[key] = {
-                "tail_mean": mean,
-                "tail_std": std,
-                "tail_min": min(values),
-                "tail_max": max(values),
-            }
-
-        press_info = stage.get("Press")
-        if isinstance(press_info, dict) and "tail_mean" in press_info:
-            mean_press = float(press_info["tail_mean"])
-            stage["pressure_acceptance"] = {
-                "abs_tail_mean_bar": abs(mean_press),
-                "target_abs_mean_bar": target_abs_mean_bar,
-                "passes_target": abs(mean_press) <= target_abs_mean_bar,
-            }
-
-        summary["stages"][name] = stage
-
-    return summary
-
-
-def write_pressure_summary(
-    run_dir: Path,
-    tail_fraction: float = 0.25,
-    target_abs_mean_bar: float = 1000.0,
-) -> Path:
-    summary = summarize_lammps_pressure(
-        run_dir=run_dir,
-        tail_fraction=tail_fraction,
-        target_abs_mean_bar=target_abs_mean_bar,
-    )
-    out = run_dir / "pressure_summary.json"
-    out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print(f"[ok] Wrote pressure summary: {out}")
-
-    for stage_name, stage in summary.get("stages", {}).items():
-        if not isinstance(stage, dict) or not stage.get("exists"):
-            continue
-        press = stage.get("Press")
-        if isinstance(press, dict) and press.get("tail_mean") is not None:
-            mean = float(press["tail_mean"])
-            std = float(press.get("tail_std", 0.0))
-            acc = stage.get("pressure_acceptance", {})
-            passes = acc.get("passes_target") if isinstance(acc, dict) else None
-            print(
-                f"[pressure] {stage_name}: "
-                f"tail mean Press={mean:.3f} bar, std={std:.3f} bar, target pass={passes}"
-            )
-
-    return out
-
-
-
-def save_artifacts(run_dir: Path, artifact_root: Path, run_name: str, run_label: str) -> Path:
-    """Copy key outputs to a labeled results folder.
-
-    This is meant for preserving pilot/protocol-development runs without
-    pretending they are final production statistics.
-    """
-    import hashlib
-    import shutil
-    import time
-
-    run_dir = run_dir.resolve()
-    out_dir = (artifact_root / run_name).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    patterns = [
-        "metadata.json",
-        "mddms_fit.json",
-        "stress_timeseries.dat",
-        "*.in",
-        "*.log",
-        "03_after_mddms.data",
-        "03_after_mddms.restart",
-        "trajectory.lammpstrj",
-        "atom_stress.lammpstrj",
-    ]
-
-    copied: list[dict[str, object]] = []
-    seen: set[Path] = set()
-
-    for pattern in patterns:
-        for src in sorted(run_dir.glob(pattern)):
-            if not src.is_file() or src in seen:
-                continue
-            seen.add(src)
-            dst = out_dir / src.name
-            shutil.copy2(src, dst)
-            sha = hashlib.sha256(dst.read_bytes()).hexdigest()
-            copied.append(
-                {
-                    "name": dst.name,
-                    "bytes": dst.stat().st_size,
-                    "sha256": sha,
-                }
-            )
-
-    readme = f"""# {run_name}
-
-Saved MD-DMS run artifact.
-
-Status: {run_label}
-
-Source run directory:
-
-```text
-{run_dir}
-```
-
-Notes:
-- Pilot/protocol-development runs should not be mixed into final Paper 2 statistics unless explicitly reclassified.
-- `stress_timeseries.dat` and `mddms_fit.json` are system-level MD-DMS outputs.
-- `trajectory.lammpstrj` is intended for OVITO structural visualization if present.
-- `atom_stress.lammpstrj` is intended for selected local-response analysis if present.
-"""
-    (out_dir / "README.md").write_text(readme, encoding="utf-8")
-
-    manifest = {
-        "run_name": run_name,
-        "run_label": run_label,
-        "source_run_dir": str(run_dir),
-        "artifact_dir": str(out_dir),
-        "created_unix_time": time.time(),
-        "files": copied,
-    }
-    (out_dir / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-
-    print(f"[ok] Saved artifacts to: {out_dir}")
-    print(f"[ok] Copied {len(copied)} files")
-    return out_dir
-
-
-
-def build_effective_preset(args: argparse.Namespace) -> Preset:
-    base = PRESETS[args.preset]
-    updates: dict[str, object] = {}
-
-    mapping = {
-        "melt_ps": args.melt_ps,
-        "quench_rate_K_per_ps": args.quench_rate_K_per_ps,
-        "relax_ps": args.relax_ps,
-        "equilibrate_ps": args.equilibrate_ps,
-        "mddms_period_ps": args.mddms_period_ps,
-        "mddms_cycles": args.mddms_cycles,
-        "thermo_every_steps": args.thermo_every_steps,
-        "stress_every_steps": args.stress_every_steps,
-    }
-
-    for key, value in mapping.items():
-        if value is not None:
-            updates[key] = value
-
-    if updates:
-        updates["name"] = f"{base.name}_{args.preset_name_suffix}"
-        return replace(base, **updates)
-
-    return base
-
-
-
-def print_model_aliases() -> None:
-    print("Available model aliases:")
-    for alias, info in MODEL_ALIASES.items():
-        path = project_path(info["path"])
-        status = "OK" if path.exists() else "missing"
-        print(f"  {alias:10s} kind={info['kind']:7s} status={status:7s} path={path}")
-        print(f"             {info['description']}")
-
-
-def resolve_model(model_alias: str, model_kind: str | None, model_file: str | None) -> tuple[str, Path, str]:
-    if model_alias == "custom":
-        if not model_kind or not model_file:
-            raise ValueError("--model-alias custom requires --model-kind and --model-file")
-        return model_kind, project_path(model_file), "custom model"
-
-    if model_alias not in MODEL_ALIASES:
-        raise ValueError(f"Unknown model alias {model_alias!r}. Available: {sorted(MODEL_ALIASES)}")
-
-    info = MODEL_ALIASES[model_alias]
-    return info["kind"], project_path(info["path"]), info["description"]
+    return model_alias, model_kind, model_file
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Generate and optionally run a Cu-Zr MD-DMS pilot workflow.",
+        description="Generate and optionally run a Cu-Zr MD-DMS workflow.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-
     p.add_argument("--run-name", default="pilot_001")
     p.add_argument("--run-root", default="runs")
     p.add_argument("--preset", choices=sorted(PRESETS), default="pilot")
+    p.add_argument("--model-alias", choices=sorted(MODEL_ALIASES), default=None)
+    p.add_argument("--model-kind", choices=["mace", "eam"], default=None)
+    p.add_argument("--model-file", default=None, help="MACE ML-IAP .pt file or EAM file.")
 
-    # Optional protocol overrides. These let us strengthen relaxation without
-    # creating a new hard-coded preset for every experiment.
+    p.add_argument("--natoms", type=int, default=4000)
+    p.add_argument("--cu-fraction", type=float, default=0.64)
+    p.add_argument("--density-g-cm3", type=float, default=7.20)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--timestep-ps", type=float, default=0.001, help="0.001 ps = 1 fs.")
+    p.add_argument("--temperature-high-K", type=float, default=3000.0)
+    p.add_argument("--temperature-low-K", type=float, default=300.0)
+    p.add_argument("--pressure-bar", type=float, default=0.0)
+    p.add_argument("--strain-amplitude", type=float, default=0.01)
+    p.add_argument("--tdamp-ps", type=float, default=0.1)
+    p.add_argument("--pdamp-ps", type=float, default=1.0)
+
+    # Preset overrides. These are the critical production controls.
     p.add_argument("--melt-ps", type=float, default=None)
     p.add_argument("--quench-rate-K-per-ps", type=float, default=None)
     p.add_argument("--relax-ps", type=float, default=None)
@@ -936,63 +840,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--mddms-cycles", type=int, default=None)
     p.add_argument("--thermo-every-steps", type=int, default=None)
     p.add_argument("--stress-every-steps", type=int, default=None)
-    p.add_argument("--preset-name-suffix", default="custom")
+    p.add_argument("--dump-every-steps", type=int, default=None)
 
+    p.add_argument("--dump-trajectory", action="store_true", help="Dump OVITO trajectory during MD-DMS.")
     p.add_argument(
-        "--model-alias",
-        choices=sorted(MODEL_ALIASES) + ["custom"],
-        default="mace_c",
-        help="Runtime model alias prepared by scripts/cloud/startup_mddms_runtime.sh.",
-    )
-    p.add_argument(
-        "--model-kind",
-        choices=["mace", "eam_fs"],
-        default=None,
-        help="Usually inferred from --model-alias. Required only for --model-alias custom.",
-    )
-    p.add_argument(
-        "--model-file",
-        default=None,
-        help="Usually inferred from --model-alias. For custom: MACE ML-IAP .pt or EAM/FS .fs file.",
-    )
-    p.add_argument("--list-models", action="store_true", help="List known model aliases and exit.")
-
-    p.add_argument("--natoms", type=int, default=4000)
-    p.add_argument("--cu-fraction", type=float, default=0.64)
-    p.add_argument("--density-g-cm3", type=float, default=7.20)
-    p.add_argument("--seed", type=int, default=42)
-
-    p.add_argument("--timestep-ps", type=float, default=0.001, help="LAMMPS metal timestep. 0.001 ps = 1 fs.")
-    p.add_argument("--temperature-high-K", type=float, default=3000.0)
-    p.add_argument("--temperature-low-K", type=float, default=300.0)
-    p.add_argument("--pressure-bar", type=float, default=0.0)
-
-    p.add_argument("--strain-amplitude", type=float, default=0.01)
-    p.add_argument("--tdamp-ps", type=float, default=0.1)
-    p.add_argument("--pdamp-ps", type=float, default=1.0)
-
-    p.add_argument(
-        "--dump-trajectory",
-        action="store_true",
-        help="Write OVITO-friendly structural trajectory during MD-DMS: id type x y z ix iy iz.",
-    )
-    p.add_argument(
-        "--dump-atomic",
         "--dump-atomic-stress",
         dest="dump_atomic",
         action="store_true",
-        help="Write per-atom stress trajectory during MD-DMS. Can create large files.",
+        help="Dump per-atom stress tensor components during MD-DMS.",
+    )
+    p.add_argument(
+        "--dump-atomic",
+        dest="dump_atomic",
+        action="store_true",
+        help="Alias for --dump-atomic-stress.",
     )
     p.add_argument(
         "--dump-voronoi",
         action="store_true",
-        help="Also write Voronoi volume with per-atom stress. Requires LAMMPS VORONOI package.",
-    )
-    p.add_argument(
-        "--dump-every-steps",
-        type=int,
-        default=None,
-        help="Override atomic/trajectory dump interval in MD steps.",
+        help="Optional Voronoi dump; requires LAMMPS VORONOI package.",
     )
     p.add_argument(
         "--stress-sign",
@@ -1000,70 +866,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=-1.0,
         help="Multiplier for pxy when fitting stress. Use -1 or +1 depending on convention.",
     )
-    p.add_argument(
-        "--save-artifacts",
-        action="store_true",
-        help="Copy key outputs to results/pilots/<run-name> or another artifact root.",
-    )
-    p.add_argument("--artifact-root", default="results/pilots")
-    p.add_argument("--run-label", default="pilot / non-production")
-    p.add_argument(
-        "--lmp-command",
-        default=None,
-        help="LAMMPS command without -in. If omitted, uses optimized default for MACE and simple lmp for EAM.",
-    )
-
+    p.add_argument("--lmp-command", default=None, help="LAMMPS command without -in.")
     p.add_argument("--execute", action="store_true", help="Actually run LAMMPS stages after generating files.")
     p.add_argument("--analyze", action="store_true", help="Fit stress_timeseries.dat after execution or existing run.")
     p.add_argument(
-        "--pressure-summary",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Write pressure_summary.json from LAMMPS logs when possible.",
+        "--save-artifacts",
+        action="store_true",
+        help="Compatibility flag. Core artifacts are always saved in the run directory.",
     )
-    p.add_argument(
-        "--pressure-tail-fraction",
-        type=float,
-        default=0.25,
-        help="Fraction of the end of each thermo log used for pressure summary.",
-    )
-    p.add_argument(
-        "--pressure-target-bar",
-        type=float,
-        default=1000.0,
-        help="Reference target for absolute tail-mean pressure in bar.",
-    )
-
     return p
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-
-    if args.list_models:
-        print_model_aliases()
-        return 0
-
-    effective_preset = build_effective_preset(args)
-
-    model_kind, model_file, description = resolve_model(args.model_alias, args.model_kind, args.model_file)
+    model_alias, model_kind, model_file = resolve_model(args)
     lmp_command = args.lmp_command or default_lmp_command(model_kind)
     run_dir = str(Path(args.run_root) / args.run_name)
-
-    print(f"[model] alias={args.model_alias} kind={model_kind}")
-    print(f"[model] file={model_file}")
-    print(f"[model] {description}")
-    print(f"[preset] requested={args.preset} effective={effective_preset.name}")
-    print(f"[preset] {asdict(effective_preset)}")
-    print(f"[lammps] command={lmp_command}")
+    effective_preset = build_effective_preset(args)
 
     cfg = RunConfig(
         run_name=args.run_name,
         run_dir=run_dir,
         preset=args.preset,
-        model_alias=args.model_alias,
+        model_alias=model_alias,
         model_kind=model_kind,
-        model_file=str(model_file),
+        model_file=model_file,
         natoms=args.natoms,
         cu_fraction=args.cu_fraction,
         density_g_cm3=args.density_g_cm3,
@@ -1083,28 +910,19 @@ def main(argv: Iterable[str] | None = None) -> int:
         lmp_command=lmp_command,
     )
 
-    generate_run(cfg)
-
+    generate_run(cfg, effective_preset)
     run_dir_path = Path(run_dir).resolve()
 
     if args.execute:
         execute_stages(run_dir_path, cfg)
 
-    if args.pressure_summary:
-        write_pressure_summary(
-            run_dir=run_dir_path,
-            tail_fraction=args.pressure_tail_fraction,
-            target_abs_mean_bar=args.pressure_target_bar,
-        )
-
     if args.analyze:
-        preset = effective_preset
         stress_file = run_dir_path / "stress_timeseries.dat"
         if not stress_file.exists():
             raise FileNotFoundError(f"Cannot analyze: missing {stress_file}")
         fit = fit_mddms_response(
             stress_file=stress_file,
-            period_ps=preset.mddms_period_ps,
+            period_ps=effective_preset.mddms_period_ps,
             strain_amplitude=cfg.strain_amplitude,
             stress_sign=cfg.stress_sign,
         )
@@ -1113,21 +931,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"[ok] Wrote fit: {fit_path}")
         print(json.dumps(fit, indent=2))
 
-    if args.save_artifacts:
-        save_artifacts(
-            run_dir=run_dir_path,
-            artifact_root=Path(args.artifact_root),
-            run_name=args.run_name,
-            run_label=args.run_label,
-        )
+        pressure = write_pressure_summary(run_dir_path)
+        print(f"[ok] Wrote pressure summary: {run_dir_path / 'pressure_summary.json'}")
 
     print()
-    print("Next commands:")
+    print("Verification commands:")
+    print(f"  grep -E 'mddms_period_ps|mddms_cycles|mddms_total_ps|mddms_steps|dump_trajectory|dump_atomic|dump_every_steps' {run_dir_path / 'metadata.json'}")
+    print(f"  grep -nE 'dump|lammpstrj|stress/atom|variable period|run ' {run_dir_path / '03_mddms_shear.in'}")
+    print()
+    print("Manual execution from run dir, if not using --execute:")
     print(f"  cd {run_dir_path}")
     print("  bash run_lammps.sh")
-    print()
-    print("Or generate + execute directly:")
-    print("  python scripts/run/run_mddms_pilot.py --execute --analyze ...")
     return 0
 
 
