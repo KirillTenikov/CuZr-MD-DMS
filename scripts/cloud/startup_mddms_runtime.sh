@@ -93,6 +93,29 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+normalize_kokkos_arch_flag() {
+  # Kokkos CMake options are case-sensitive. Normalize common typos
+  # such as KokkOS_ARCH_HOPPER90 or KOKKOS_ARCH_HOPPER90 to the
+  # exact spelling Kokkos_ARCH_HOPPER90 expected by Kokkos.
+  case "${KOKKOS_ARCH_FLAG}" in
+    KokkOS_ARCH_*)
+      KOKKOS_ARCH_FLAG="Kokkos_ARCH_${KOKKOS_ARCH_FLAG#KokkOS_ARCH_}"
+      ;;
+    KOKKOS_ARCH_*)
+      KOKKOS_ARCH_FLAG="Kokkos_ARCH_${KOKKOS_ARCH_FLAG#KOKKOS_ARCH_}"
+      ;;
+  esac
+
+  case "${KOKKOS_ARCH_FLAG}" in
+    Kokkos_ARCH_*)
+      ;;
+    *)
+      die "KOKKOS_ARCH_FLAG must look like Kokkos_ARCH_AMPERE80 or Kokkos_ARCH_HOPPER90; got: ${KOKKOS_ARCH_FLAG}"
+      ;;
+  esac
+  export KOKKOS_ARCH_FLAG
+}
+
 activate_python_env() {
   if [ -f /opt/cuzr_python_prebuilt.env ]; then
     # shellcheck disable=SC1091
@@ -104,6 +127,14 @@ activate_python_env() {
   fi
 
   export PATH="${CUZR_ENV_PREFIX}/bin:${PATH}"
+
+  # Prefer the mamba/conda runtime libraries over older system libraries.
+  # This prevents scipy/e3nn/mace from loading /usr/lib/.../libstdc++.so.6
+  # without newer CXXABI symbols required by compiled Python extensions.
+  export LD_LIBRARY_PATH="${CUZR_ENV_PREFIX}/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+  export LIBRARY_PATH="${CUZR_ENV_PREFIX}/lib:${LIBRARY_PATH:-}"
+  export PYTHONNOUSERSITE=1
+  hash -r
 
   if [ ! -x "${PYTHON_BIN}" ]; then
     echo "[warning] ${PYTHON_BIN} not found, falling back to python from PATH"
@@ -179,7 +210,18 @@ try:
 except Exception as exc:
     print("torch import/check failed:", repr(exc))
     sys.exit(1)
-for name in ["numpy", "scipy", "mace", "cupy", "cuequivariance", "cuequivariance_torch"]:
+# Import scipy submodules explicitly because scipy.signal/fft pull compiled
+# extensions that expose libstdc++/CXXABI problems early.
+try:
+    import scipy
+    import scipy.fft
+    import scipy.signal
+    print("scipy import check: OK", scipy.__version__)
+except Exception as exc:
+    print("scipy import check failed:", repr(exc))
+    sys.exit(1)
+
+for name in ["numpy", "mace", "cupy", "cuequivariance", "cuequivariance_torch"]:
     spec = importlib.util.find_spec(name)
     print(f"{name}:", "OK" if spec else "MISSING")
 PY
@@ -340,6 +382,18 @@ build_lammps() {
     export NVCC_WRAPPER_DEFAULT_COMPILER="$(command -v g++)"
   fi
 
+  normalize_kokkos_arch_flag
+
+  # Kokkos enforces exact CMake option case. If a previous attempt cached
+  # KokkOS_ARCH_* or KOKKOS_ARCH_* instead of Kokkos_ARCH_*, delete the
+  # build directory so the next configure starts cleanly.
+  if [ -f "${LAMMPS_BUILD_DIR}/CMakeCache.txt" ]; then
+    if grep -qE 'KokkOS_ARCH_|KOKKOS_ARCH_' "${LAMMPS_BUILD_DIR}/CMakeCache.txt"; then
+      echo "[warning] stale/wrong-case Kokkos arch option found in CMakeCache; removing ${LAMMPS_BUILD_DIR}"
+      rm -rf "${LAMMPS_BUILD_DIR}"
+    fi
+  fi
+
   cmake -S "${LAMMPS_DIR}/cmake" -B "${LAMMPS_BUILD_DIR}" \
     -D CMAKE_BUILD_TYPE=Release \
     -D CMAKE_INSTALL_PREFIX="${LAMMPS_INSTALL_DIR}" \
@@ -383,7 +437,9 @@ export LAMMPS_BUILD_DIR="${LAMMPS_BUILD_DIR}"
 export LAMMPS_INSTALL_DIR="${LAMMPS_INSTALL_DIR}"
 export MD_DMS_RUN_ROOT="${MD_DMS_RUN_ROOT}"
 export PATH="${LAMMPS_INSTALL_DIR}/bin:${CUZR_ENV_PREFIX}/bin:\$PATH"
-export LD_LIBRARY_PATH="${LAMMPS_INSTALL_DIR}/lib:\${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${LAMMPS_INSTALL_DIR}/lib:${CUZR_ENV_PREFIX}/lib:/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}"
+export LIBRARY_PATH="${CUZR_ENV_PREFIX}/lib:\${LIBRARY_PATH:-}"
+export PYTHONNOUSERSITE=1
 export PYTHONPATH="${LAMMPS_INSTALL_DIR}/lib/python:\${PYTHONPATH:-}"
 export OMP_NUM_THREADS="\${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="\${MKL_NUM_THREADS:-1}"
@@ -694,6 +750,7 @@ run_tiny_test() {
 }
 
 activate_python_env
+normalize_kokkos_arch_flag
 ensure_project_dir
 print_config
 check_python_stack
