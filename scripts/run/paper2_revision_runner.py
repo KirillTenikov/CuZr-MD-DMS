@@ -12,7 +12,7 @@ that historical generator to create LAMMPS inputs, but then:
 
 The script is intentionally restricted to the Paper-2 protocol.  It does not
 change the potential, preparation trajectory, thermostat, deformation rule,
-or analysis convention.
+or analysis convention.  Revision v2 adds non-invasive Stage-03 restart checkpoints, a restart-aware resume input, and a portable external-backup helper.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -38,6 +39,12 @@ STAGE_INPUTS = {
 }
 PREP_STAGES = [STAGE_INPUTS[name] for name in ("00", "01", "02")]
 MDDMS_STAGE = STAGE_INPUTS["03"]
+CHECKPOINTED_STAGE = "03_mddms_shear.in"
+BASE_STAGE = "03_mddms_shear_uncheckpointed.in"
+RESUME_STAGE = "03_resume_mddms.in"
+CHECKPOINT_DIR = "checkpoints"
+CHECKPOINT_GLOB = "restart.*"
+DEFAULT_CHECKPOINT_EVERY_STEPS = 10_000
 
 
 @dataclass(frozen=True)
@@ -64,6 +71,7 @@ class Protocol:
     dump_every_steps: int
     stress_sign: float
     lmp_command: str
+    checkpoint_every_steps: int
 
 
 def sha256(path: Path) -> str | None:
@@ -210,6 +218,7 @@ def protocol_from_args(args: argparse.Namespace) -> Protocol:
         dump_every_steps=args.dump_every_steps,
         stress_sign=args.stress_sign,
         lmp_command=args.lmp_command,
+        checkpoint_every_steps=args.checkpoint_every_steps,
     )
 
 
@@ -377,6 +386,380 @@ def remove_unused_preparation_files(branch_dir: Path) -> None:
             path.unlink()
 
 
+
+def mddms_total_steps(protocol: Protocol) -> int:
+    """Return the fixed total number of Stage-03 integration steps."""
+    return int(round(protocol.mddms_period_ps * protocol.mddms_cycles / protocol.timestep_ps))
+
+
+def _mace_or_eam_block(model: dict) -> str:
+    """Build the pair/neighbor commands for a restart input from the recorded model."""
+    kind = str(model.get("kind"))
+    raw_path = model.get("path")
+    if not raw_path:
+        raise RuntimeError("Model path is missing from the branch manifest")
+    model_path = Path(str(raw_path))
+    if kind == "mace":
+        pair = f"pair_style mliap unified {model_path} 0\npair_coeff * * Cu Zr"
+    elif kind == "eam":
+        pair = f"pair_style eam/fs\npair_coeff * * {model_path} Cu Zr"
+    else:
+        raise RuntimeError(f"Unsupported model kind for restart input: {kind!r}")
+    return "\n".join([pair, "neighbor 2.0 bin", "neigh_modify delay 0 every 1 check yes"])
+
+
+def checkpoint_files(run_dir: Path) -> list[Path]:
+    """Return unique-timestep restart files in numerical order."""
+    folder = run_dir / CHECKPOINT_DIR
+    if not folder.exists():
+        return []
+    candidates: list[tuple[int, Path]] = []
+    for path in folder.glob(CHECKPOINT_GLOB):
+        match = re.fullmatch(r"restart\.(\d+)", path.name)
+        if match and path.is_file() and path.stat().st_size > 0:
+            candidates.append((int(match.group(1)), path))
+    return [path for _, path in sorted(candidates)]
+
+
+def write_checkpoint_manifest(
+    run_dir: Path,
+    protocol: Protocol,
+    *,
+    base_input: Path,
+    checkpointed_input: Path,
+    resume_input: Path,
+    parent_manifest: Path | None = None,
+) -> Path:
+    """Write deterministic checkpoint/restart provenance for one Stage-03 branch."""
+    manifest: dict = {
+        "schema_version": 1,
+        "created_utc": utc_now(),
+        "kind": "paper2_stage03_checkpoint_plan",
+        "run_dir": str(run_dir.resolve()),
+        "checkpoint": {
+            "directory": CHECKPOINT_DIR,
+            "filename_pattern": f"{CHECKPOINT_DIR}/{CHECKPOINT_GLOB}",
+            "every_steps": protocol.checkpoint_every_steps,
+            "every_ps": protocol.checkpoint_every_steps * protocol.timestep_ps,
+            "total_steps": mddms_total_steps(protocol),
+            "resume_input": RESUME_STAGE,
+            "note": "Each wildcard restart filename includes its completed timestep; the highest complete timestep is the preferred resume point.",
+        },
+        "inputs": {
+            "historical_generated_stage03": file_record(base_input),
+            "checkpointed_stage03": file_record(checkpointed_input),
+            "resume_stage03": file_record(resume_input),
+        },
+        "protocol": asdict(protocol),
+        "reproducibility": {
+            "revision_wrapper_sha256": sha256(Path(__file__).resolve()),
+            "git": git_info(Path.cwd().resolve()),
+        },
+        "notes": [
+            "Checkpoint writes do not change the MD-DMS force field, thermostat, deformation variables, timestep, period, or cycle count.",
+            "A restart must be resumed with the same Docker image, LAMMPS binary/build, GPU execution layout, and MACE model recorded for this run.",
+            "A local restart is not an off-machine backup. Run checkpoint_sync.py against a persistent external destination while production is running.",
+        ],
+    }
+    if parent_manifest is not None and parent_manifest.exists():
+        manifest["parent_branch_manifest"] = file_record(parent_manifest)
+    destination = run_dir / "checkpoint_manifest.json"
+    write_json(destination, manifest)
+    return destination
+
+
+def patch_stage03_for_checkpoints(run_dir: Path, protocol: Protocol, model: dict) -> tuple[Path, Path, Path]:
+    """Preserve the generated Stage-03 input, add restart writes, and create a resume input.
+
+    The historical generator remains unchanged.  The first-run input differs only by
+    periodic binary restart output.  The resume input reads one of those restarts and
+    reissues the same potential, NVT, and variable-form xy deformation definitions.
+    """
+    stage_path = run_dir / CHECKPOINTED_STAGE
+    if not stage_path.exists():
+        raise FileNotFoundError(f"Missing generated Stage-03 input: {stage_path}")
+    if protocol.checkpoint_every_steps <= 0:
+        raise ValueError("--checkpoint-every-steps must be positive")
+    if protocol.checkpoint_every_steps % protocol.dump_every_steps != 0:
+        raise ValueError(
+            "checkpoint cadence must be an integer multiple of dump cadence so every restart aligns with a saved trajectory frame"
+        )
+    original = stage_path.read_text(encoding="utf-8")
+    if "\nrestart " in original:
+        raise RuntimeError(f"{stage_path} already contains restart directives; refusing to patch twice")
+    if "reset_timestep 0" not in original or "velocity all create" not in original:
+        raise RuntimeError("Unexpected Stage-03 structure: expected a fresh Stage-03 input generated by the historical runner")
+
+    base_path = run_dir / BASE_STAGE
+    if base_path.exists():
+        raise FileExistsError(f"Refusing to overwrite existing preserved input: {base_path}")
+    shutil.copy2(stage_path, base_path)
+
+    expected_steps = mddms_total_steps(protocol)
+    run_pattern = re.compile(r"(?m)^(?P<indent>\s*)run\s+(?P<steps>\d+)\s*$")
+    matches = list(run_pattern.finditer(original))
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected exactly one LAMMPS run command in Stage-03 input; found {len(matches)}")
+    match = matches[0]
+    observed_steps = int(match.group("steps"))
+    if observed_steps != expected_steps:
+        raise RuntimeError(
+            f"Generated Stage-03 run length ({observed_steps}) does not match protocol ({expected_steps})"
+        )
+    checkpoint_line = (
+        "# Paper-2 revision safety: binary restart after every completed checkpoint interval.\n"
+        f"restart {protocol.checkpoint_every_steps} {CHECKPOINT_DIR}/{CHECKPOINT_GLOB}\n"
+    )
+    replacement = checkpoint_line + match.group(0) + "\nrestart 0"
+    checkpointed = original[: match.start()] + replacement + original[match.end() :]
+    stage_path.write_text(checkpointed, encoding="utf-8")
+
+    metadata = read_json(run_dir / "metadata.json")
+    cfg = metadata.get("run_config")
+    preset = metadata.get("preset")
+    if not isinstance(cfg, dict) or not isinstance(preset, dict):
+        raise RuntimeError("Generated metadata.json is missing run_config or effective preset")
+    if cfg.get("dump_atomic") or cfg.get("dump_voronoi"):
+        raise RuntimeError("Paper-2 revision branches must not enable atomic-stress or Voronoi dumps")
+    dump_trajectory = bool(cfg.get("dump_trajectory"))
+    dump_every = int(cfg.get("dump_every_steps") or preset.get("dump_every_steps"))
+    stress_every = int(preset.get("stress_every_steps"))
+    thermo_every = int(preset.get("thermo_every_steps"))
+    dt = float(cfg.get("timestep_ps"))
+    temperature = float(cfg.get("temperature_low_K"))
+    tdamp = float(cfg.get("tdamp_ps"))
+    gamma0 = float(cfg.get("strain_amplitude"))
+    period = float(preset.get("mddms_period_ps"))
+
+    trajectory_lines = ""
+    if dump_trajectory:
+        trajectory_lines = (
+            f"dump traj all custom {dump_every} trajectory.lammpstrj id type x y z ix iy iz\n"
+            "dump_modify traj sort id append yes\n"
+        )
+    resume_text = f"""# Generated by paper2_revision_runner.py. Do not edit by hand.
+# Resume the checkpointed Stage-03 MD-DMS trajectory without resetting time,
+# velocities, or the sinusoidal deformation phase.
+units metal
+atom_style atomic
+boundary p p p
+newton on
+read_restart ${{restart_file}}
+{_mace_or_eam_block(model)}
+timestep {dt:.8f}
+thermo {thermo_every}
+thermo_style custom step time temp pe ke etotal press pxx pyy pzz pxy lx ly lz xy
+# IMPORTANT: this resume input preserves the current timestep, velocities, and deformation phase.
+variable gamma0 equal {gamma0:.12f}
+variable period equal {period:.12f}
+variable omega equal 2.0*{3.14159265358979323846:.20f}/v_period
+variable gamma equal v_gamma0*sin(v_omega*time)
+variable gammadot equal v_gamma0*v_omega*cos(v_omega*time)
+variable xy_target equal v_gamma*ly
+variable xy_rate equal v_gammadot*ly
+fix thermostat all nvt temp {temperature:.6f} {temperature:.6f} {tdamp:.6f}
+fix deform all deform 1 xy variable v_xy_target v_xy_rate remap x
+variable time_ps equal time
+variable pxy_bar equal pxy
+variable temp_K equal temp
+variable pe_eV equal pe
+variable ke_eV equal ke
+variable press_bar equal press
+variable xy_A equal xy
+variable ly_A equal ly
+fix ts all ave/time {stress_every} 1 {stress_every} v_time_ps v_gamma v_pxy_bar v_temp_K v_pe_eV v_ke_eV v_press_bar v_xy_A v_ly_A append stress_timeseries.dat
+{trajectory_lines}restart {protocol.checkpoint_every_steps} {CHECKPOINT_DIR}/{CHECKPOINT_GLOB}
+run {expected_steps} upto
+restart 0
+unfix ts
+unfix deform
+unfix thermostat
+write_data 03_after_mddms.data
+write_restart 03_after_mddms.restart
+"""
+    resume_path = run_dir / RESUME_STAGE
+    resume_path.write_text(resume_text, encoding="utf-8")
+    (run_dir / CHECKPOINT_DIR).mkdir(exist_ok=True)
+    return base_path, stage_path, resume_path
+
+
+def write_checkpoint_sync_helper(run_dir: Path) -> Path:
+    """Create a portable Python copier for persistent/off-machine checkpoint backup.
+
+    It intentionally uses only the Python standard library so it works inside the
+    project container without requiring rsync.  It writes every destination file
+    atomically through a temporary name, so an interrupted copy leaves the prior
+    verified destination file intact.
+    """
+    destination = run_dir / "checkpoint_sync.py"
+    source = r"""#!/usr/bin/env python3
+# Mirror a live Paper-2 Stage-03 run to an external persistent destination.
+# Examples:
+#   python checkpoint_sync.py --backup-dir /mnt/persistent/Paper2 --once
+#   python checkpoint_sync.py --backup-dir /mnt/persistent/Paper2 --loop --interval-sec 60 --trajectory-interval-sec 300
+# The backup destination must be outside the disposable VM/container filesystem.
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+RUN_DIR = Path(__file__).resolve().parent
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def atomically_copy(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".partial")
+    with src.open("rb") as inp, tmp.open("wb") as out:
+        shutil.copyfileobj(inp, out, length=1024 * 1024)
+        out.flush()
+        os.fsync(out.fileno())
+    shutil.copystat(src, tmp, follow_symlinks=True)
+    os.replace(tmp, dst)
+
+
+def files_to_copy(include_trajectory: bool) -> list[Path]:
+    names = [
+        "03_mddms_shear.in", "03_mddms_shear_uncheckpointed.in", "03_resume_mddms.in",
+        "metadata.json", "branch_manifest.json", "checkpoint_manifest.json",
+        "stress_timeseries.dat", "03_mddms_shear.log", "run_lammps.sh",
+    ]
+    selected = [RUN_DIR / name for name in names if (RUN_DIR / name).is_file()]
+    selected.extend(sorted((RUN_DIR / "checkpoints").glob("restart.*")) if (RUN_DIR / "checkpoints").exists() else [])
+    if include_trajectory and (RUN_DIR / "trajectory.lammpstrj").is_file():
+        selected.append(RUN_DIR / "trajectory.lammpstrj")
+    return selected
+
+
+def sync_once(backup_base: Path, include_trajectory: bool) -> dict:
+    target = backup_base.resolve() / RUN_DIR.name
+    target.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for src in files_to_copy(include_trajectory):
+        rel = src.relative_to(RUN_DIR)
+        dst = target / rel
+        atomically_copy(src, dst)
+        copied.append({"path": str(rel), "bytes": dst.stat().st_size, "sha256": sha256(dst)})
+    status = {
+        "updated_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "source_run_dir": str(RUN_DIR),
+        "backup_run_dir": str(target),
+        "trajectory_copied": include_trajectory,
+        "files": copied,
+    }
+    (target / "checkpoint_backup_status.json").write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(status, indent=2))
+    return status
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Mirror live checkpoints to an external persistent backup destination.")
+    parser.add_argument("--backup-dir", default=os.environ.get("MDDMS_BACKUP_DIR"), help="External persistent directory; never the run directory itself.")
+    parser.add_argument("--once", action="store_true", help="Copy once and exit.")
+    parser.add_argument("--loop", action="store_true", help="Continue copying until interrupted.")
+    parser.add_argument("--interval-sec", type=float, default=60.0)
+    parser.add_argument("--trajectory-interval-sec", type=float, default=300.0)
+    args = parser.parse_args()
+    if bool(args.once) == bool(args.loop):
+        parser.error("choose exactly one of --once or --loop")
+    if not args.backup_dir:
+        parser.error("--backup-dir or MDDMS_BACKUP_DIR is required")
+    backup = Path(args.backup_dir).expanduser().resolve()
+    if backup == RUN_DIR or RUN_DIR in backup.parents:
+        parser.error("backup destination must be outside the live run directory")
+    if args.interval_sec <= 0 or args.trajectory_interval_sec <= 0:
+        parser.error("intervals must be positive")
+    last_trajectory = 0.0
+    while True:
+        now = time.monotonic()
+        include_trajectory = now - last_trajectory >= args.trajectory_interval_sec
+        sync_once(backup, include_trajectory)
+        if include_trajectory:
+            last_trajectory = now
+        if args.once:
+            return 0
+        time.sleep(args.interval_sec)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+    destination.write_text(source, encoding="utf-8")
+    os.chmod(destination, 0o755)
+    return destination
+
+
+def latest_checkpoint(run_dir: Path, explicit: str | None = None) -> Path:
+    if explicit:
+        selected = Path(explicit)
+        if not selected.is_absolute():
+            selected = run_dir / selected
+        selected = selected.resolve()
+        if not selected.exists() or selected.stat().st_size == 0:
+            raise FileNotFoundError(f"Requested restart is missing or empty: {selected}")
+        return selected
+    files = checkpoint_files(run_dir)
+    if not files:
+        raise FileNotFoundError(f"No completed checkpoint files found under {run_dir / CHECKPOINT_DIR}")
+    return files[-1]
+
+
+def run_lammps_resume(run_dir: Path, restart_file: Path, lmp_command: str, dry_run: bool) -> None:
+    input_path = run_dir / RESUME_STAGE
+    if not input_path.exists():
+        raise FileNotFoundError(f"Missing resume input: {input_path}")
+    command = shlex.split(lmp_command) + [
+        "-var", "restart_file", str(restart_file),
+        "-log", "03_resume_mddms.log",
+        "-in", RESUME_STAGE,
+    ]
+    print("[resume]", " ".join(shlex.quote(item) for item in command), flush=True)
+    if dry_run:
+        return
+    shell_lines = runtime_shell_prefix()[3:]
+    shell_lines.append("exec " + shlex.join(command))
+    subprocess.run(["bash", "-c", "\n".join(shell_lines)], cwd=run_dir, check=True)
+
+
+def resume(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    manifest_path = run_dir / "checkpoint_manifest.json"
+    manifest = read_json(manifest_path)
+    protocol_data = manifest.get("protocol")
+    if not isinstance(protocol_data, dict):
+        raise RuntimeError(f"Checkpoint manifest has no protocol: {manifest_path}")
+    protocol = Protocol(**protocol_data)
+    restart = latest_checkpoint(run_dir, args.restart_file)
+    resume_log = run_dir / "resume_history.json"
+    previous: list[dict] = []
+    if resume_log.exists():
+        existing = read_json(resume_log)
+        prior = existing.get("attempts")
+        if isinstance(prior, list):
+            previous = prior
+    previous.append({
+        "requested_utc": utc_now(),
+        "restart": file_record(restart),
+        "lmp_command": protocol.lmp_command,
+        "dry_run": bool(args.dry_run),
+    })
+    write_json(resume_log, {"schema_version": 1, "run_dir": str(run_dir), "attempts": previous})
+    run_lammps_resume(run_dir, restart, protocol.lmp_command, args.dry_run)
+    return 0
+
 def prepare(args: argparse.Namespace) -> int:
     protocol = protocol_from_args(args)
     run_root = Path(args.run_root)
@@ -431,6 +814,10 @@ def branch(args: argparse.Namespace) -> int:
     if parent_branchpoint.exists():
         shutil.copy2(parent_branchpoint, branch_dir / "parent_stage02_branchpoint.json")
     remove_unused_preparation_files(branch_dir)
+    metadata = read_json(branch_dir / "metadata.json")
+    model = model_record_from_metadata(branch_dir)
+    base_stage, checkpointed_stage, resume_stage = patch_stage03_for_checkpoints(branch_dir, protocol, model)
+    sync_helper = write_checkpoint_sync_helper(branch_dir)
     write_stage_runner(branch_dir, protocol.lmp_command, [MDDMS_STAGE])
 
     metadata = read_json(branch_dir / "metadata.json")
@@ -441,6 +828,10 @@ def branch(args: argparse.Namespace) -> int:
     }
     metadata["parent_run_dir"] = str(parent_dir)
     metadata["branch_manifest"] = "branch_manifest.json"
+    metadata["checkpoint_manifest"] = "checkpoint_manifest.json"
+    metadata["checkpoint_every_steps"] = protocol.checkpoint_every_steps
+    metadata["checkpoint_resume_input"] = RESUME_STAGE
+    metadata["checkpoint_sync_helper"] = sync_helper.name
     write_json(branch_dir / "metadata.json", metadata)
 
     manifest = {
@@ -469,9 +860,22 @@ def branch(args: argparse.Namespace) -> int:
             "P20 and P50 are comparable branches only when their parent_stage02.data SHA-256 is identical.",
         ],
     }
-    write_json(branch_dir / "branch_manifest.json", manifest)
+    branch_manifest_path = branch_dir / "branch_manifest.json"
+    write_json(branch_manifest_path, manifest)
+    checkpoint_manifest = write_checkpoint_manifest(
+        branch_dir,
+        protocol,
+        base_input=base_stage,
+        checkpointed_input=checkpointed_stage,
+        resume_input=resume_stage,
+        parent_manifest=branch_manifest_path,
+    )
 
     print(f"[ok] Stage-03 branch generated: {branch_dir}")
+    print(f"[ok] Checkpoints: every {protocol.checkpoint_every_steps} steps in {branch_dir / CHECKPOINT_DIR}")
+    print(f"[ok] Resume input: {resume_stage}")
+    print(f"[ok] External backup helper: {sync_helper}")
+    print(f"[ok] Checkpoint manifest: {checkpoint_manifest}")
     if args.execute:
         run_lammps_stage(branch_dir, MDDMS_STAGE, protocol.lmp_command, dry_run=False)
     return 0
@@ -500,6 +904,12 @@ def add_protocol_arguments(parser: argparse.ArgumentParser, *, include_period: b
     parser.add_argument("--thermo-every-steps", type=int, default=None)
     parser.add_argument("--stress-every-steps", type=int, default=None)
     parser.add_argument("--dump-every-steps", type=int, default=1000)
+    parser.add_argument(
+        "--checkpoint-every-steps",
+        type=int,
+        default=DEFAULT_CHECKPOINT_EVERY_STEPS,
+        help="Write a binary Stage-03 restart at this interval; must align with dump cadence.",
+    )
     parser.add_argument("--stress-sign", type=float, default=-1.0)
     parser.add_argument(
         "--lmp-command",
@@ -525,20 +935,31 @@ def build_parser() -> argparse.ArgumentParser:
     branch_parser.add_argument("--execute", action="store_true", help="Run Stage 03 after generating the branch.")
     branch_parser.add_argument("--dry-run", action="store_true")
     branch_parser.set_defaults(function=branch)
+
+    resume_parser = subparsers.add_parser("resume", help="Resume a checkpointed Stage-03 branch from its latest completed restart.")
+    resume_parser.add_argument("--run-dir", required=True, help="Existing Stage-03 branch directory.")
+    resume_parser.add_argument("--restart-file", default=None, help="Optional explicit restart path; default is the highest completed checkpoint timestep.")
+    resume_parser.add_argument("--dry-run", action="store_true", help="Show the LAMMPS resume command without executing it.")
+    resume_parser.set_defaults(function=resume)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.mddms_cycles != 6:
-        parser.error("This Paper-2 revision wrapper is restricted to six MD-DMS cycles.")
-    if args.natoms != 4000 or abs(args.cu_fraction - 0.64) > 1.0e-12:
-        parser.error("This Paper-2 revision wrapper is restricted to Cu64Zr36 with 4000 atoms.")
-    if abs(args.temperature_low_K - 300.0) > 1.0e-12 or abs(args.strain_amplitude - 0.01) > 1.0e-12:
-        parser.error("This Paper-2 revision wrapper is restricted to 300 K and gamma0 = 0.01.")
-    if args.command == "branch" and args.mddms_period_ps not in {20.0, 50.0}:
-        parser.error("Paper-2 Stage-03 branches must use --mddms-period-ps 20 or 50.")
+    if args.command in {"prepare", "branch"}:
+        if args.mddms_cycles != 6:
+            parser.error("This Paper-2 revision wrapper is restricted to six MD-DMS cycles.")
+        if args.natoms != 4000 or abs(args.cu_fraction - 0.64) > 1.0e-12:
+            parser.error("This Paper-2 revision wrapper is restricted to Cu64Zr36 with 4000 atoms.")
+        if abs(args.temperature_low_K - 300.0) > 1.0e-12 or abs(args.strain_amplitude - 0.01) > 1.0e-12:
+            parser.error("This Paper-2 revision wrapper is restricted to 300 K and gamma0 = 0.01.")
+        if args.command == "branch" and args.mddms_period_ps not in {20.0, 50.0}:
+            parser.error("Paper-2 Stage-03 branches must use --mddms-period-ps 20 or 50.")
+        if args.checkpoint_every_steps <= 0:
+            parser.error("--checkpoint-every-steps must be positive.")
+        if args.checkpoint_every_steps % args.dump_every_steps != 0:
+            parser.error("--checkpoint-every-steps must be an integer multiple of --dump-every-steps.")
     return int(args.function(args))
 
 
