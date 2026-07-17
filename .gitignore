@@ -1,4 +1,32 @@
+# Raw archives
+*.tar
+*.tar.gz
+*.tgz
 *.zip
+*.7z
+*.rar
+
+# Local manuscripts
+*.doc
+*.docx
+*.odt
+*.rtf
+*.pages
+~$*.doc
+~$*.docx
+
+# Local figures and images
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.bmp
+*.gif
+*.webp
+*.svg
+*.eps
+
 
 # Python
 __pycache__/
