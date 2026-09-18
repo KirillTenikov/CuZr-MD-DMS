@@ -2,7 +2,7 @@
 """Generic Stage-02/Stage-03 branching for Cu-Zr MD-DMS.
 
 This runner intentionally reuses the already-tested Paper-2 revision helpers
-instead of copying them.  ``run_mddms_pilot.py`` remains the source of truth
+instead of copying them. ``run_mddms_pilot.py`` remains the source of truth
 for LAMMPS input generation; this script adds flexible branching controls for
 later campaigns such as Paper 3.
 
@@ -18,12 +18,10 @@ The historical Paper-2 runner is left untouched, so old commands remain valid.
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import shlex
 import shutil
 import subprocess
-import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
@@ -34,6 +32,20 @@ START_DATA_RECREATE = "data-recreate-velocities"
 START_RESTART_PRESERVE = "restart-preserve-velocities"
 START_MODES = (START_DATA_RECREATE, START_RESTART_PRESERVE)
 GENERATED_STAGE = "03_mddms_shear_generated.in"
+
+PREPARATION_PRESET_FIELDS = (
+    "melt_ps",
+    "quench_rate_K_per_ps",
+    "relax_ps",
+    "equilibrate_ps",
+)
+PREPARATION_DERIVED_FIELDS = (
+    "melt_steps",
+    "quench_ps",
+    "quench_steps",
+    "relax_steps",
+    "equilibrate_steps",
+)
 
 
 def _kind(slug: str, suffix: str) -> str:
@@ -102,6 +114,33 @@ def _run_generator_with_overrides(
         subprocess.run(cmd, check=True)
 
 
+def _preparation_record_from_metadata(run_dir: Path) -> dict:
+    """Return the effective preparation protocol recorded by the generator.
+
+    Preparation overrides such as ``--melt-ps 100`` are applied inside the
+    historical generator and therefore live in ``metadata.json`` rather than
+    in the generic ``Protocol`` dataclass. Copying them into the Stage-02
+    branchpoint manifest makes that manifest self-contained for preparation
+    controls such as Paper-3 P1 without changing the historical generator.
+    """
+    metadata_path = run_dir / "metadata.json"
+    metadata = legacy.read_json(metadata_path)
+    preset = metadata.get("preset")
+    derived = metadata.get("derived")
+    if not isinstance(preset, dict) or not isinstance(derived, dict):
+        raise RuntimeError(
+            f"Generated metadata.json in {run_dir} is missing preset or derived data"
+        )
+
+    effective = {key: preset.get(key) for key in PREPARATION_PRESET_FIELDS}
+    derived_record = {key: derived.get(key) for key in PREPARATION_DERIVED_FIELDS}
+    return {
+        "effective": effective,
+        "derived": derived_record,
+        "source_metadata": legacy.file_record(metadata_path),
+    }
+
+
 def _write_generic_stage02_manifest(
     run_dir: Path,
     protocol: legacy.Protocol,
@@ -117,6 +156,7 @@ def _write_generic_stage02_manifest(
         "kind": _kind(campaign_slug, "stage02_branchpoint"),
         "run_dir": str(run_dir.resolve()),
         "protocol": asdict(protocol),
+        "preparation": _preparation_record_from_metadata(run_dir),
         "stage02": {
             "data": legacy.file_record(data_file),
             "restart": legacy.file_record(restart_file),
@@ -124,6 +164,7 @@ def _write_generic_stage02_manifest(
         "model": legacy.model_record_from_metadata(run_dir),
         "notes": [
             "Stage 02 is the reusable parent state for Stage-03 controls.",
+            "Effective preparation settings are copied from the generator metadata so preparation overrides are explicit in this manifest.",
             "Historical mode recreates Stage-03 velocities after read_data.",
             "Restart-preserving mode keeps the equilibrated Stage-02 velocities.",
         ],
@@ -142,7 +183,10 @@ def _apply_start_mode(branch_dir: Path, start_mode: str) -> Path:
 
     text = stage.read_text(encoding="utf-8")
     if start_mode == START_DATA_RECREATE:
-        if "read_data       02_after_equilibrate_nvt.data" not in text and "read_data 02_after_equilibrate_nvt.data" not in text:
+        if (
+            "read_data       02_after_equilibrate_nvt.data" not in text
+            and "read_data 02_after_equilibrate_nvt.data" not in text
+        ):
             raise RuntimeError("Historical start mode expected read_data for Stage 02")
         if "velocity        all create" not in text and "velocity all create" not in text:
             raise RuntimeError("Historical start mode expected velocity recreation")
@@ -183,7 +227,7 @@ def _patch_restart_mode_for_checkpoints(
     protocol: legacy.Protocol,
     model: dict,
 ) -> tuple[Path, Path, Path]:
-    """Checkpoint patch equivalent to the legacy helper, without requiring velocity create."""
+    """Checkpoint patch equivalent to the legacy helper, without velocity recreation."""
     stage = run_dir / legacy.MDDMS_STAGE
     original = stage.read_text(encoding="utf-8")
     if "read_restart    02_after_equilibrate_nvt.restart" not in original:
@@ -240,7 +284,43 @@ def _patch_restart_mode_for_checkpoints(
 
     resume = run_dir / legacy.RESUME_STAGE
     resume.write_text(
-        f"""# Generated by mddms_branch_runner.py. Do not edit by hand.\nunits metal\natom_style atomic\nboundary p p p\nnewton on\nread_restart ${{restart_file}}\n{legacy._mace_or_eam_block(model)}\ntimestep {dt:.8f}\nthermo {thermo_every}\nthermo_style custom step time temp pe ke etotal press pxx pyy pzz pxy lx ly lz xy\nvariable gamma0 equal {gamma0:.12f}\nvariable period equal {period:.12f}\nvariable omega equal 2.0*3.14159265358979323846/v_period\nvariable gamma equal v_gamma0*sin(v_omega*time)\nvariable gammadot equal v_gamma0*v_omega*cos(v_omega*time)\nvariable xy_target equal v_gamma*ly\nvariable xy_rate equal v_gammadot*ly\nfix thermostat all nvt temp {temperature:.6f} {temperature:.6f} {tdamp:.6f}\nfix deform all deform 1 xy variable v_xy_target v_xy_rate remap x\nvariable time_ps equal time\nvariable pxy_bar equal pxy\nvariable temp_K equal temp\nvariable pe_eV equal pe\nvariable ke_eV equal ke\nvariable press_bar equal press\nvariable xy_A equal xy\nvariable ly_A equal ly\nfix ts all ave/time {stress_every} 1 {stress_every} v_time_ps v_gamma v_pxy_bar v_temp_K v_pe_eV v_ke_eV v_press_bar v_xy_A v_ly_A append stress_timeseries.dat\n{trajectory}restart {protocol.checkpoint_every_steps} {legacy.CHECKPOINT_DIR}/{legacy.CHECKPOINT_GLOB}\nrun {expected_steps} upto\nrestart 0\nunfix ts\nunfix deform\nunfix thermostat\nwrite_data 03_after_mddms.data\nwrite_restart 03_after_mddms.restart\n""",
+        f"""# Generated by mddms_branch_runner.py. Do not edit by hand.
+units metal
+atom_style atomic
+boundary p p p
+newton on
+read_restart ${{restart_file}}
+{legacy._mace_or_eam_block(model)}
+timestep {dt:.8f}
+thermo {thermo_every}
+thermo_style custom step time temp pe ke etotal press pxx pyy pzz pxy lx ly lz xy
+variable gamma0 equal {gamma0:.12f}
+variable period equal {period:.12f}
+variable omega equal 2.0*3.14159265358979323846/v_period
+variable gamma equal v_gamma0*sin(v_omega*time)
+variable gammadot equal v_gamma0*v_omega*cos(v_omega*time)
+variable xy_target equal v_gamma*ly
+variable xy_rate equal v_gammadot*ly
+fix thermostat all nvt temp {temperature:.6f} {temperature:.6f} {tdamp:.6f}
+fix deform all deform 1 xy variable v_xy_target v_xy_rate remap x
+variable time_ps equal time
+variable pxy_bar equal pxy
+variable temp_K equal temp
+variable pe_eV equal pe
+variable ke_eV equal ke
+variable press_bar equal press
+variable xy_A equal xy
+variable ly_A equal ly
+fix ts all ave/time {stress_every} 1 {stress_every} v_time_ps v_gamma v_pxy_bar v_temp_K v_pe_eV v_ke_eV v_press_bar v_xy_A v_ly_A append stress_timeseries.dat
+{trajectory}restart {protocol.checkpoint_every_steps} {legacy.CHECKPOINT_DIR}/{legacy.CHECKPOINT_GLOB}
+run {expected_steps} upto
+restart 0
+unfix ts
+unfix deform
+unfix thermostat
+write_data 03_after_mddms.data
+write_restart 03_after_mddms.restart
+""",
         encoding="utf-8",
     )
     (run_dir / legacy.CHECKPOINT_DIR).mkdir(exist_ok=True)
@@ -417,7 +497,11 @@ def _add_protocol_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--thermo-every-steps", type=int, default=None)
     parser.add_argument("--stress-every-steps", type=int, default=None)
     parser.add_argument("--dump-every-steps", type=int, default=1000)
-    parser.add_argument("--checkpoint-every-steps", type=int, default=legacy.DEFAULT_CHECKPOINT_EVERY_STEPS)
+    parser.add_argument(
+        "--checkpoint-every-steps",
+        type=int,
+        default=legacy.DEFAULT_CHECKPOINT_EVERY_STEPS,
+    )
     parser.add_argument("--stress-sign", type=float, default=-1.0)
     parser.add_argument("--campaign-slug", default="mddms")
     parser.add_argument(

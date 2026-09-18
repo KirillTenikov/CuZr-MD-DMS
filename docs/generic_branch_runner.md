@@ -59,9 +59,13 @@ The generic `prepare` command passes preparation overrides to the historical gen
 
 The generated `metadata.json` remains the authoritative record of the effective preset and command line.
 
+The generic runner also copies the effective preparation settings from `metadata.json` into `stage02_branchpoint.json`. This is important for preparation-history controls such as a 100 ps melt: the Stage-02 manifest explicitly records the effective melt time, quench rate, NPT/NVT durations, and their derived step counts even though those overrides are intentionally not added to the historical Paper-2 `Protocol` dataclass.
+
 ## Checkpoint and provenance behavior
 
 Stage-03 branches retain the existing checkpoint/resume design. Each child run has a new directory and does not overwrite its parent. The branch copies the Stage-02 data/restart and parent metadata, records the requested protocol, preserves the original generated Stage-03 input, stores the effective uncheckpointed input, writes a checkpointed input and resume input, and records the selected start mode.
+
+For a newly prepared Stage-02 parent, `stage02_branchpoint.json` contains both the generic protocol and an explicit `preparation` record derived from the generator metadata. This keeps the branchpoint manifest self-contained while leaving `run_mddms_pilot.py` unchanged.
 
 ## Regression tests
 
@@ -69,7 +73,9 @@ Stage-03 branches retain the existing checkpoint/resume design. Each child run h
 
 - byte preservation of the historical Stage-03 input before checkpoint patching;
 - the restart-preserving transformation;
-- propagation of composition, strain amplitude, thermostat damping and period into the historical generator command.
+- propagation of composition, strain amplitude, thermostat damping and period into the historical generator command;
+- forwarding of preparation overrides to the historical generator;
+- recording of effective preparation settings in the Stage-02 manifest.
 
 Run from the repository root with:
 
