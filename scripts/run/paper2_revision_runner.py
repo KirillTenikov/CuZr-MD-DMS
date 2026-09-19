@@ -145,7 +145,7 @@ def write_json(path: Path, content: dict) -> None:
 
 
 def runtime_shell_prefix() -> list[str]:
-    """The same environment setup used by the historical generated shell script."""
+    """Bootstrap the MD-DMS runtime, falling back to the legacy runtime only if needed."""
     return [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
@@ -153,8 +153,7 @@ def runtime_shell_prefix() -> list[str]:
         "source /opt/venv/bin/activate || true",
         "if [ -f /workspace/cuzr_mddms_runtime.env ]; then",
         "  source /workspace/cuzr_mddms_runtime.env",
-        "fi",
-        "if [ -f /workspace/cuzr_runtime.env ]; then",
+        "elif [ -f /workspace/cuzr_runtime.env ]; then",
         "  source /workspace/cuzr_runtime.env",
         "fi",
         "",
@@ -190,7 +189,7 @@ def run_lammps_stage(run_dir: Path, stage_input: str, lmp_command: str, dry_run:
     print("[execute]", " ".join(shlex.quote(item) for item in command), flush=True)
     if dry_run:
         return
-    # Match the environment bootstrap used by the historical generated runner.
+    # Match the environment bootstrap used by the generated runner.
     shell_lines = runtime_shell_prefix()[3:]
     shell_lines.append("exec " + shlex.join(command))
     subprocess.run(["bash", "-c", "\n".join(shell_lines)], cwd=run_dir, check=True)
@@ -384,7 +383,6 @@ def remove_unused_preparation_files(branch_dir: Path) -> None:
         path = branch_dir / name
         if path.exists():
             path.unlink()
-
 
 
 def mddms_total_steps(protocol: Protocol) -> int:
@@ -759,6 +757,7 @@ def resume(args: argparse.Namespace) -> int:
     write_json(resume_log, {"schema_version": 1, "run_dir": str(run_dir), "attempts": previous})
     run_lammps_resume(run_dir, restart, protocol.lmp_command, args.dry_run)
     return 0
+
 
 def prepare(args: argparse.Namespace) -> int:
     protocol = protocol_from_args(args)
